@@ -11,6 +11,7 @@
  */
 
 #include <linux/cred.h>
+#include <linux/blkdev.h>
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/sched.h>
@@ -65,6 +66,22 @@ void *sep_store_open_ro(const char *path)
 	return IS_ERR(f) ? NULL : f;
 }
 
+void *sep_store_open_block(const char *path, int writable)
+{
+	struct file *f = open_as_kernel(path,
+					writable ? O_RDWR | O_LARGEFILE : O_RDONLY | O_LARGEFILE,
+					0);
+
+	if (IS_ERR(f))
+		return NULL;
+	if (!S_ISBLK(file_inode(f)->i_mode) ||
+	    bdev_read_only(file_bdev(f)) == !!writable) {
+		filp_close(f, NULL);
+		return NULL;
+	}
+	return f;
+}
+
 void sep_store_close(void *handle)
 {
 	if (handle)
@@ -76,6 +93,8 @@ long long sep_store_size(void *handle)
 {
 	struct file *f = handle;
 
+	if (S_ISBLK(file_inode(f)->i_mode))
+		return bdev_nr_bytes(file_bdev(f));
 	return i_size_read(file_inode(f));
 }
 

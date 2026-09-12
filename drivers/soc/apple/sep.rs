@@ -23,7 +23,6 @@ mod refkey_seal;
 mod rxring;
 mod sbio;
 mod scrd;
-mod seed;
 mod sensor;
 mod shim;
 mod shmem;
@@ -32,6 +31,7 @@ mod store;
 mod transfer;
 mod trusted;
 mod xarm;
+mod xart_store;
 
 use kernel::{
     device,
@@ -794,7 +794,10 @@ struct SepData {
     bio_dev: Mutex<Option<shim::BioChardev>>,
 
     #[pin]
-    store: Mutex<Option<store::Store>>,
+    store: Mutex<Option<xart_store::Store>>,
+
+    #[pin]
+    host_store: Mutex<Option<store::Store>>,
 
     #[pin]
     xarm: Mutex<XarmState>,
@@ -883,36 +886,44 @@ impl SepData {
         )?;
         let dma_ring = dma::Coherent::<u8>::zeroed_slice(dev, DMA_RING_SIZE, GFP_KERNEL)?;
 
-        let mut store = match store::Store::open() {
-            Ok(mut store) => {
-
-                if !store.seeded() {
-                    match seed::import(&mut store) {
-                        Ok(_imported) => {},
-                        Err(e) => dev_err!(
-                            dev,
-                            "seed '{}' could not be imported ({:?}); store was never seeded, so the exchange stops after the first ROOT_READ and endpoint count stays at {}\n",
-                            seed::SEED_PATH,
-                            e,
-                            ENDPOINTS_BEFORE_EXCHANGE
-                        ),
-                    }
-                }
-
+        let xart_writes = *module_parameters::xart_writes.value() != 0;
+        let store = match xart_store::Store::open(xart_writes) {
+            Ok(store) => {
+                let (slots, records, revision, malformed, duplicates, repaired, writable) =
+                    store.summary();
+                dev_info!(
+                    dev,
+                    "xART: {} slots, {} live records, max revision {}, {} malformed, {} duplicate, {} repaired; writes {}\n",
+                    slots,
+                    records,
+                    revision,
+                    malformed,
+                    duplicates,
+                    repaired,
+                    if writable { "ENABLED" } else { "disabled" }
+                );
                 Some(store)
             }
             Err(e) => {
                 dev_err!(
                     dev,
-                    "could not open the backing store '{}': {:?}; persistent-state exchange cannot run\n",
-                    store::STORE_PATH,
+                    "shared xART mapping '{}' is unavailable or invalid: {:?}\n",
+                    xart_store::STORE_PATH,
                     e
                 );
+                return Err(e);
+            }
+        };
+
+        let mut host_store = match store::Store::open() {
+            Ok(store) => Some(store),
+            Err(e) => {
+                dev_warn!(dev, "Linux host-state store unavailable: {:?}\n", e);
                 None
             }
         };
 
-        let bio_index = match store.as_mut().map(bio::IdentityIndex::load) {
+        let bio_index = match host_store.as_mut().map(bio::IdentityIndex::load) {
             Some(Ok(index)) => index,
             Some(Err(_)) => bio::IdentityIndex::new(),
             None => bio::IdentityIndex::new(),
@@ -968,6 +979,7 @@ impl SepData {
                 bio_index <- new_mutex!(bio_index),
                 bio_dev <- new_mutex!(None),
                 store <- new_mutex!(store),
+                host_store <- new_mutex!(host_store),
                 xarm <- new_mutex!(XarmState::new()),
                 rng <- new_mutex!(None),
                 machine_refkey <- new_mutex!(None),
@@ -1233,17 +1245,23 @@ impl SepData {
         Ok(())
     }
 
-    fn with_store<R>(&self, f: impl FnOnce(&mut store::Store) -> R) -> Option<R> {
+    fn with_store<R>(&self, f: impl FnOnce(&mut xart_store::Store) -> R) -> Option<R> {
         let mut guard = self.store.lock();
+        let store: &mut Option<xart_store::Store> = &mut guard;
+        store.as_mut().map(f)
+    }
+
+    fn with_host_store<R>(&self, f: impl FnOnce(&mut store::Store) -> R) -> Option<R> {
+        let mut guard = self.host_store.lock();
         let store: &mut Option<store::Store> = &mut guard;
         store.as_mut().map(f)
     }
 
     // pre-generate: an entropy draw on the drain path would deadlock on its own reply
     fn prepare_os_uuid(&self) {
-        let key = xarm::os_uuid_key();
+        let key = store::Key::root(0xf0);
 
-        let existing = match self.with_store(|store| store.read(&key)) {
+        let existing = match self.with_host_store(|store| store.read(&key)) {
             Some(result) => result,
             None => return,
         };
@@ -1258,17 +1276,12 @@ impl SepData {
         }
 
         let mut uuid = [0u8; 16];
-        for word in 0..4 {
-            match self.get_entropy_word() {
-                Ok(v) => uuid[word * 4..word * 4 + 4].copy_from_slice(&v.to_le_bytes()),
-                Err(_) => {
-                    return;
-                }
-            }
+        if shim::random_bytes(&mut uuid).is_err() {
+            return;
         }
         xarm::make_uuid_v4(&mut uuid);
 
-        match self.with_store(|store| store.write(&key, &uuid)) {
+        match self.with_host_store(|store| store.write(&key, &uuid)) {
             Some(Ok(())) => {}
             Some(Err(_)) => {
                 return;
@@ -1971,6 +1984,7 @@ impl SepData {
         *self.mbox.lock() = None;
 
         let _ = self.store.lock().take();
+        let _ = self.host_store.lock().take();
 
         for slot in [&self.ool_xarm, &self.ool_sbio, &self.ool_sks] {
             if let Some(buffers) = slot.lock().take() {
@@ -2208,4 +2222,10 @@ module! {
     name: "apple_sep",
     description: "Apple SEP coprocessor: warm attach, endpoint discovery and tag-correlated control endpoint",
     license: "Dual MIT/GPL",
+    params: {
+        xart_writes: u8 {
+            default: 0,
+            description: "Allow writes to the validated shared xART mapping",
+        },
+    },
 }

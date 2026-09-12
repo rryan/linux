@@ -7,7 +7,8 @@
 
 use crate::xarm::{XarmReply as Reply, XarmRequest as Request};
 use kernel::soc::apple::mailbox::Message;
-use crate::store::{crc16_ccitt_false, Key, Store, MAX_VALUE};
+use crate::store::crc16_ccitt_false;
+use crate::xart_store::{Key, Store, MAX_VALUE};
 use kernel::prelude::*;
 
 pub(crate) use crate::proto::EP_XARM;
@@ -35,8 +36,6 @@ const ROOT_READ_PREFIX: usize = 17;
 
 /// `0x01` rejects when `(length >> 4) >= 0x7ff`.
 const ROOT_WRITE_MAX: usize = 0x7fef;
-
-pub(crate) const PRIVATE_TYPE_OS_UUID: u8 = 0xF0;
 
 impl Reply {
     fn ok(req: &Request, length: u16) -> Reply {
@@ -172,7 +171,7 @@ pub(crate) fn service(
         }
 
         OP_SESSION_READ => {
-            if outbound.len() < 16 {
+            if outbound.len() != 16 {
                 return Serviced {
                     reply: Reply::fail(req, STATUS_FAILED),
                     reply_bytes: 0,
@@ -294,10 +293,6 @@ pub(crate) fn service(
 pub(crate) fn make_uuid_v4(bytes: &mut [u8; 16]) {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
-}
-
-pub(crate) fn os_uuid_key() -> Key {
-    Key::root(PRIVATE_TYPE_OS_UUID)
 }
 
 pub(crate) struct XarmRequest {

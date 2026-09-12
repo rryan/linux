@@ -22,7 +22,8 @@ impl SepData {
         body.put_blob(der_set)?;
         let img = image::build_request(image::Version::V1, self.sks_timestamp_us(), &body)?;
         let len = self.sks_image_len(&img)?;
-        let msg = crate::sks::encode_sks_perform_operation(self.sks_next_seq(), len).ok_or(EINVAL)?;
+        let msg =
+            crate::sks::encode_sks_perform_operation(self.sks_next_seq(), len).ok_or(EINVAL)?;
         Ok(SksRequest {
             name: crate::sks::SKS_PERFORM_OP_NAME,
             msg,
@@ -54,8 +55,12 @@ impl SepData {
         let create_der = {
             let mut items: KVec<(&[u8], RV<'_>)> = KVec::new();
             if items.push((b"o", RV::Utf8(b"oc")), GFP_KERNEL).is_err()
-                || items.push((b"bc", RV::Integer(PROTECTION_CLASS)), GFP_KERNEL).is_err()
-                || items.push((b"kt", RV::Integer(KEY_TYPE)), GFP_KERNEL).is_err()
+                || items
+                    .push((b"bc", RV::Integer(PROTECTION_CLASS)), GFP_KERNEL)
+                    .is_err()
+                || items
+                    .push((b"kt", RV::Integer(KEY_TYPE)), GFP_KERNEL)
+                    .is_err()
             {
                 return None;
             }
@@ -65,8 +70,7 @@ impl SepData {
         if cout.reply.status != 0 {
             return None;
         }
-        let cbody =
-            self.sks_report_response(crate::sks::SKS_PERFORM_OP_NAME, &cout)?;
+        let cbody = self.sks_report_response(crate::sks::SKS_PERFORM_OP_NAME, &cout)?;
         let mut cf = proto::FieldCursor::new(cbody);
         let (Some(0), Some(cblob)) = (cf.i32(), cf.blob()) else {
             return None;
@@ -78,13 +82,13 @@ impl SepData {
 
     fn refkey_pub(blob: &[u8]) -> Option<&[u8]> {
         let rk_tlv = crate::der::refkey_find(blob, b"rk")?;
-        let pub_raw = crate::der::refkey_find(rk_tlv, b"pub")
-            .and_then(crate::der::octet_string_body)?;
+        let pub_raw =
+            crate::der::refkey_find(rk_tlv, b"pub").and_then(crate::der::octet_string_body)?;
         (pub_raw.len() == refkey_seal::POINT_LEN).then_some(pub_raw)
     }
 
     pub(crate) fn sks_machine_refkey(&self, handle: crate::sks::KeyBagHandle, secret: &[u8]) {
-        const MACHINE_REFKEY_PATH: &CStr = c"/var/lib/apple-sep-refkey.bin";
+        const MACHINE_REFKEY_PATH: &CStr = c"/var/lib/aurora-sep-refkey.bin";
 
         if self.machine_refkey.lock().is_some() {
             return;
@@ -198,7 +202,11 @@ impl SepData {
         let der = crate::der::encode_refkey_set(&items).ok()?;
         let out = self.sks_send(self.sks_req_refkey(handle.value(), &der))?;
         if out.reply.status != 0 {
-            dev_warn!(self.dev, "sks: ref-key attest sign failed (status {})\n", out.reply.status);
+            dev_warn!(
+                self.dev,
+                "sks: ref-key attest sign failed (status {})\n",
+                out.reply.status
+            );
             return None;
         }
         let body = self.sks_report_response(crate::sks::SKS_PERFORM_OP_NAME, &out)?;
@@ -213,7 +221,7 @@ impl SepData {
         Some(owned)
     }
 
-    /// Attestation of key possession by signing proof; op `oa` (Apple-CA-chained)
+    /// Attestation of key possession by signing proof; op `oa` (attestation-chained)
     /// needs the SEP device attestation key, absent on a Linux-attached SEP.
     pub(crate) fn refkey_attest_sign(&self, challenge: &[u8]) -> Result<(KVec<u8>, KVec<u8>)> {
         self.ensure_machine_refkey()?;
@@ -258,7 +266,11 @@ impl SepData {
         let der = crate::der::encode_refkey_set(&items).ok()?;
         let out = self.sks_send(self.sks_req_refkey(handle.value(), &der))?;
         if out.reply.status != 0 {
-            dev_warn!(self.dev, "trusted-keys: ref-key unseal failed (status {})\n", out.reply.status);
+            dev_warn!(
+                self.dev,
+                "trusted-keys: ref-key unseal failed (status {})\n",
+                out.reply.status
+            );
             return None;
         }
         let body = self.sks_report_response(crate::sks::SKS_PERFORM_OP_NAME, &out)?;

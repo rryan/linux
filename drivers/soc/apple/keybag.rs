@@ -11,7 +11,7 @@ use crate::shim;
 use crate::store::crc16_ccitt_false;
 use kernel::prelude::*;
 
-pub(crate) const KEYBAG_PATH: &CStr = c"/var/lib/apple-sep-keybag.bin";
+pub(crate) const KEYBAG_PATH: &CStr = c"/var/lib/aurora-sep-keybag.bin";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Slot {

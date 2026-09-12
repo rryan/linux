@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 // Copyright 2026 Dj
 
-//! Host-owned slotted backing store for the SEP's persistent records: a
-//! compile-time path exclusive to this driver, re-initialised and reseeded on a
-//! magic mismatch. Re-initialised is never served empty — an empty store halts the SEP.
+//! Linux-only state. SEP anti-replay records live in `xart_store`.
 
 use crate::shim;
 use kernel::prelude::*;
 
-pub(crate) const STORE_PATH: &CStr = c"/var/lib/apple-sep-state.bin";
+pub(crate) const STORE_PATH: &CStr = c"/var/lib/aurora-sep-host-state.bin";
 
 const BLOCK_SIZE: usize = 0x8000;
 const BLOCK_COUNT: usize = 72;
@@ -16,7 +14,7 @@ pub(crate) const STORE_SIZE: usize = BLOCK_SIZE * BLOCK_COUNT;
 const SLOT_COUNT: usize = BLOCK_COUNT - 1;
 pub(crate) const MAX_VALUE: usize = BLOCK_SIZE;
 
-const MAGIC: [u8; 16] = *b"APPLE-SEP-STOR01";
+const MAGIC: [u8; 16] = *b"AURORA-SEP-STOR\x01";
 const VERSION: u32 = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,8 +78,6 @@ const SB_GENERATION: usize = 28;
 const SB_INTENT_KIND: usize = 36;
 const SB_INTENT_SLOT: usize = 37;
 const SB_INTENT_TYPE: usize = 39;
-// In previously reserved space, so an older store reads it as zero (unseeded).
-const SB_SEEDED: usize = 40;
 const SB_SLOT_TABLE: usize = 64;
 const SLOT_ENTRY_SIZE: usize = 24;
 
@@ -96,7 +92,6 @@ pub(crate) struct Store {
     generation: u64,
     pub(crate) recovered: bool,
     pub(crate) fresh: bool,
-    seeded: bool,
 }
 
 fn le32(buf: &[u8], off: usize) -> u32 {
@@ -119,7 +114,6 @@ impl Store {
             generation: 0,
             recovered: false,
             fresh: false,
-            seeded: false,
         };
 
         let size = store.file.size()?;
@@ -142,8 +136,6 @@ impl Store {
         }
 
         store.generation = le64(&sb, SB_GENERATION);
-        store.seeded = sb[SB_SEEDED] != 0;
-
         for i in 0..SLOT_COUNT {
             let off = SB_SLOT_TABLE + i * SLOT_ENTRY_SIZE;
             let mut uuid = [0u8; 16];
@@ -174,7 +166,6 @@ impl Store {
         self.slots = [Slot::FREE; SLOT_COUNT];
         self.generation = 1;
         self.fresh = true;
-        self.seeded = false;
 
         let mut zero = KVec::with_capacity(BLOCK_SIZE, GFP_KERNEL)?;
         zero.resize(BLOCK_SIZE, 0, GFP_KERNEL)?;
@@ -206,7 +197,6 @@ impl Store {
             Intent::Write { slot, kind } => (INTENT_WRITE, slot, kind),
             Intent::Delete { slot, kind } => (INTENT_DELETE, slot, kind),
         };
-        sb[SB_SEEDED] = u8::from(self.seeded);
         sb[SB_INTENT_KIND] = ikind;
         sb[SB_INTENT_SLOT..SB_INTENT_SLOT + 2].copy_from_slice(&islot.to_le_bytes());
         sb[SB_INTENT_TYPE] = itype;
@@ -235,6 +225,9 @@ impl Store {
     }
 
     pub(crate) fn read(&mut self, key: &Key) -> Result<Option<KVec<u8>>> {
+        if !(0xf0..=0xf5).contains(&key.kind) {
+            return Err(EINVAL);
+        }
         let Some(idx) = self.find(key) else {
             return Ok(None);
         };
@@ -248,6 +241,9 @@ impl Store {
     }
 
     pub(crate) fn write(&mut self, key: &Key, value: &[u8]) -> Result<()> {
+        if !(0xf0..=0xf5).contains(&key.kind) {
+            return Err(EINVAL);
+        }
         if value.len() > MAX_VALUE {
             return Err(ENOSPC);
         }
@@ -283,6 +279,9 @@ impl Store {
     }
 
     pub(crate) fn delete(&mut self, key: &Key) -> Result<bool> {
+        if !(0xf0..=0xf5).contains(&key.kind) {
+            return Err(EINVAL);
+        }
         let Some(idx) = self.find(key) else {
             return Ok(false);
         };
@@ -297,16 +296,6 @@ impl Store {
         self.generation = self.generation.wrapping_add(1);
         self.commit()?;
         Ok(true)
-    }
-
-    // Gates import, not store-emptiness: a store emptied after the SEP moved on must not be reseeded.
-    pub(crate) fn seeded(&self) -> bool {
-        self.seeded
-    }
-
-    pub(crate) fn mark_seeded(&mut self) -> Result<()> {
-        self.seeded = true;
-        self.commit()
     }
 
 }

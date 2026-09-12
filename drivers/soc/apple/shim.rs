@@ -9,6 +9,7 @@ extern "C" {
     fn sep_store_open(path: *const c_char) -> *mut c_void;
     fn sep_store_open_trunc(path: *const c_char) -> *mut c_void;
     fn sep_store_open_ro(path: *const c_char) -> *mut c_void;
+    fn sep_store_open_block(path: *const c_char, writable: c_int) -> *mut c_void;
     fn sep_store_close(handle: *mut c_void);
     fn sep_store_size(handle: *mut c_void) -> i64;
     fn sep_store_read(handle: *mut c_void, off: i64, buf: *mut c_void, len: usize)
@@ -20,6 +21,12 @@ extern "C" {
         len: usize,
     ) -> c_long;
     fn sep_store_sync(handle: *mut c_void) -> c_int;
+    fn sep_random_bytes(buf: *mut c_void, len: usize) -> c_int;
+}
+
+pub(crate) fn random_bytes(buf: &mut [u8]) -> Result<()> {
+    // SAFETY: `buf` is writable for exactly `buf.len()` bytes.
+    kernel::error::to_result(unsafe { sep_random_bytes(buf.as_mut_ptr().cast(), buf.len()) })
 }
 
 /// Backing-store file handle.
@@ -70,6 +77,16 @@ impl StoreFile {
         Ok(StoreFile { handle })
     }
 
+    pub(crate) fn open_block(path: &CStr, writable: bool) -> Result<StoreFile> {
+        // SAFETY: `path` is NUL-terminated; the shim accepts only a block
+        // device whose global read-only state matches `writable`.
+        let handle = unsafe { sep_store_open_block(path.as_char_ptr(), c_int::from(writable)) };
+        if handle.is_null() {
+            return Err(ENODEV);
+        }
+        Ok(StoreFile { handle })
+    }
+
     pub(crate) fn size(&self) -> Result<u64> {
         // SAFETY: `handle` is live per the type invariant.
         let n = unsafe { sep_store_size(self.handle) };
@@ -100,6 +117,22 @@ impl StoreFile {
         Ok(())
     }
 
+    pub(crate) fn read_block_exact(&self, off: u64, buf: &mut [u8]) -> Result<()> {
+        // SAFETY: `handle` remains live and `buf` is writable for its length.
+        let n = result_of(unsafe {
+            sep_store_read(
+                self.handle,
+                off as i64,
+                buf.as_mut_ptr().cast::<c_void>(),
+                buf.len(),
+            )
+        })?;
+        if n != buf.len() {
+            return Err(EIO);
+        }
+        Ok(())
+    }
+
     pub(crate) fn write_all(&self, off: u64, buf: &[u8]) -> Result<()> {
         let mut done = 0usize;
         while done < buf.len() {
@@ -116,6 +149,22 @@ impl StoreFile {
                 return Err(EIO);
             }
             done += n;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_block_exact(&self, off: u64, buf: &[u8]) -> Result<()> {
+        // SAFETY: `handle` remains live and `buf` is readable for its length.
+        let n = result_of(unsafe {
+            sep_store_write(
+                self.handle,
+                off as i64,
+                buf.as_ptr().cast::<c_void>(),
+                buf.len(),
+            )
+        })?;
+        if n != buf.len() {
+            return Err(EIO);
         }
         Ok(())
     }

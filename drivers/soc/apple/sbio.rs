@@ -174,7 +174,7 @@ impl SepData {
         }
         let persisted = {
             let index = self.bio_index.lock();
-            self.with_store(|store| index.persist(store))
+            self.with_host_store(|store| index.persist(store))
         };
         match persisted {
             Some(Ok(())) => {},
@@ -218,7 +218,7 @@ impl SepData {
         // lock ordering: store lock outside the session lock (UAF otherwise)
         if outcome.is_ok() {
             let index = self.bio_index.lock();
-            let saved = self.with_store(|store| index.persist(store));
+            let saved = self.with_host_store(|store| index.persist(store));
             match saved {
                 Some(Ok(())) => {},
                 Some(Err(e)) => dev_err!(
@@ -589,7 +589,7 @@ impl SepData {
                 return Some(blob);
             }
         }
-        match self.with_store(|store| store.read(&store::Key::root(kind))) {
+        match self.with_host_store(|store| store.read(&store::Key::root(kind))) {
             Some(Ok(Some(blob))) => Some(blob),
             Some(Ok(None)) => None,
             Some(Err(_)) => {
@@ -709,7 +709,7 @@ impl SepData {
         if blob.is_empty() {
             return false;
         }
-        match self.with_store(|store| store.write(&store::Key::root(PRIVATE_TYPE_LOCKOUT), &blob)) {
+        match self.with_host_store(|store| store.write(&store::Key::root(PRIVATE_TYPE_LOCKOUT), &blob)) {
             Some(Ok(())) => {
                 true
             }
@@ -2219,7 +2219,7 @@ impl SepData {
         let persisted = {
             let mut index = self.bio_index.lock();
             index.remove(uuid);
-            self.with_store(|store| index.persist(store))
+            self.with_host_store(|store| index.persist(store))
         };
         match persisted {
             Some(Ok(())) => {},

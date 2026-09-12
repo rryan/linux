@@ -33,6 +33,7 @@ void sep_hwrng_unregister(void *mem);
 void *sep_store_open(const char *path);
 void *sep_store_open_trunc(const char *path);
 void *sep_store_open_ro(const char *path);
+void *sep_store_open_block(const char *path, int writable);
 void sep_store_close(void *handle);
 long long sep_store_size(void *handle);
 long sep_store_read(void *handle, long long off, void *buf, size_t len);
