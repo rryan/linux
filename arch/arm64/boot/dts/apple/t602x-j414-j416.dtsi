@@ -25,6 +25,7 @@
 		disp0 = &display;
 		disp0_piodma = &disp0_piodma;
 		keyboard = &keyboard;
+		sep = &sep;
 		sio = &sio;
 		usb4_0_rc = &usb4_0_acio;
 		usb4_0_pcie_adapter = &usb4_0_acio;
