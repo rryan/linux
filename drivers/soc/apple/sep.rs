@@ -1267,9 +1267,42 @@ impl SepData {
         if let Some(uuid) = dt::preboot_uuid() {
             self.xarm.lock().os_uuid = Some(uuid);
             dev_info!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
+            return;
+        }
+
+        // HostPersisted fallback for platforms without /chosen/apfs-preboot-uuid
+        const OS_UUID_PATH: &CStr = c"/var/lib/aurora-sep-os-uuid.bin";
+        let mut uuid = [0u8; 16];
+        let mut loaded = false;
+        if let Ok(file) = shim::StoreFile::open_readonly(OS_UUID_PATH) {
+            if file.read_exact(0, &mut uuid).is_ok() && !uuid.iter().all(|&b| b == 0) {
+                loaded = true;
+            }
+        }
+
+        if !loaded {
+            if shim::random_bytes(&mut uuid).is_ok() {
+                uuid[6] = (uuid[6] & 0x0f) | 0x40;
+                uuid[8] = (uuid[8] & 0x3f) | 0x80;
+                if let Ok(file) = shim::StoreFile::open_trunc(OS_UUID_PATH) {
+                    let _ = file.write_all(0, &uuid);
+                    let _ = file.sync();
+                    loaded = true;
+                }
+            }
+        }
+
+        if loaded {
+            self.xarm.lock().os_uuid = Some(uuid);
+            dev_info!(
+                self.dev,
+                "xART: using host-persisted OS UUID {:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}\n",
+                uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
+                uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]
+            );
         } else {
             self.xarm.lock().os_uuid = None;
-            dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
+            dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable and host UUID could not be provisioned\n");
         }
     }
 
