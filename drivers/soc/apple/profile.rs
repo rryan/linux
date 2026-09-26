@@ -234,13 +234,16 @@ const T6020: PlatformProfile = PlatformProfile {
     dart_range_required: true,
     wide_dma_mask: false,
     firmware_region: c"sepfw",
-    // Proven encoding: the lenient enclave takes the variant in the first word.
+    // Sepos13 enclave encoding: version 2, type 0x400000, parent -1.
     keybag_create: KeybagCreate {
-        variant: 5,
-        bag_type: 0,
+        variant: 2,
+        bag_type: 0x40_0000,
         arg: -1,
     },
-    key_store: KeyStore::Variant5,
+    // The j414 ADT carries `/defaults` `cpx-encryption-mode = 2`.
+    key_store: KeyStore::Sepos13 {
+        cpx_encryption_mode: 2,
+    },
     persistent_enrol: true,
 };
 

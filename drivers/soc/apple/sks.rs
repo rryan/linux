@@ -672,6 +672,7 @@ impl SepData {
                 out.reply.status,
                 body.len()
             );
+            let _ = keybag::mark_refused(slot);
             return false;
         }
         let variant = u32::from_le_bytes(body[0..4].try_into().unwrap());
@@ -847,7 +848,7 @@ impl SepData {
     }
 
     pub(crate) fn sks_health_check(&self, why: &CStr) -> Option<Healthy> {
-        // macOS 13.5 sends 0x4d once, at endpoint init, never again.
+        // Sepos13 sends 0x4d once at endpoint init; the health check only asserts it completed.
         if self.profile.key_store != profile::KeyStore::Variant5 {
             if !self.sks_initialized.load(Relaxed) {
                 dev_err!(
