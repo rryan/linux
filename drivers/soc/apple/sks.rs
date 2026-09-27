@@ -1001,11 +1001,22 @@ impl SepData {
             return false;
         };
 
-        let Some(uuid) = self
-            .sks_send(self.sks_req_copy_uuid_special(special))
-            .and_then(|out| self.sks_uuid_from_reply(&out))
-        else {
-            return false;
+        let stored = match keybag::read(keybag::Slot::Identity) {
+            Ok(keybag::State::Present(stored)) => stored,
+            _ => return false,
+        };
+
+        let uuid = match self.profile.key_store {
+            profile::KeyStore::Sepos13 { .. } => *stored.uuid(),
+            profile::KeyStore::Variant5 => {
+                let Some(uuid) = self
+                    .sks_send(self.sks_req_copy_uuid_special(special))
+                    .and_then(|out| self.sks_uuid_from_reply(&out))
+                else {
+                    return false;
+                };
+                uuid
+            }
         };
 
         match keybag::replace_wrapped(keybag::Slot::Identity, &wrapped, &uuid, &identity) {

@@ -798,6 +798,7 @@ impl SepData {
             }
             if state & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0 {
                 if !self.save_catacomb(who, kind, what) {
+                    dev_err!(self.dev, "enrol: save_catacomb failed for {}\n", what);
                     return false;
                 }
             } else if who.value() == user.value() {
@@ -1244,6 +1245,16 @@ impl SepData {
         sensor::power(false);
         self.note_capture_end();
 
+        dev_info!(
+            self.dev,
+            "verify: outcome={}\n",
+            match &outcome {
+                bio::VerifyOutcome::Matched(_) => "MATCHED",
+                bio::VerifyOutcome::NoMatch => "NO_MATCH",
+                bio::VerifyOutcome::Failed(_) => "FAILED",
+            }
+        );
+
         let definitive = matches!(
             &outcome,
             bio::VerifyOutcome::Matched(_) | bio::VerifyOutcome::NoMatch
@@ -1331,35 +1342,58 @@ impl SepData {
         drop(capture);
 
         let Some(assessment) = self.sbio_expect_ok(&crate::sbio::sbio_image_assessment()) else {
+            dev_err!(self.dev, "verify: sbio_image_assessment failed\n");
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         if assessment.len() <= crate::sbio::ASSESS_USABLE_MATCH {
+            dev_err!(self.dev, "verify: assessment short ({} bytes)\n", assessment.len());
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
 
-        if assessment[crate::sbio::ASSESS_USABLE_MATCH] == 0 {
+        let usable = assessment[crate::sbio::ASSESS_USABLE_MATCH];
+        dev_info!(self.dev, "verify: assessment usable_match={}\n", usable);
+        if usable == 0 {
+            dev_warn!(self.dev, "verify: sensor image not usable for match (partial contact)\n");
             return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);
         }
 
         let Some(result) = self.sbio_expect_ok(&crate::sbio::sbio_match_result()) else {
+            dev_err!(self.dev, "verify: sbio_match_result failed\n");
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         let Some(parsed) = crate::sbio::MatchResult::parse(&result) else {
+            dev_err!(self.dev, "verify: MatchResult parse failed (result {} bytes)\n", result.len());
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
 
-        if !parsed.matches(user) {
-            return bio::VerifyOutcome::NoMatch;
-        }
-
-        // match result: user id groups templates, UUID at offset 0x04 identifies one
         let identity = *parsed.identity_uuid();
         let known = self.bio_index.lock().contains_uuid(&identity);
 
+        dev_info!(
+            self.dev,
+            "verify: enclave match result uuid={} user_id={} (expected {}), matches={}, known_uuid={}\n",
+            Hex(&identity),
+            parsed.user_id,
+            user.value(),
+            parsed.matches(user),
+            known
+        );
+
+        if !parsed.matches(user) {
+            dev_info!(self.dev, "verify: enclave reported no match for this touch\n");
+            return bio::VerifyOutcome::NoMatch;
+        }
+
         if !known {
+            dev_err!(
+                self.dev,
+                "verify: matched template UUID {:02x?} is not known in host bio_index\n",
+                identity
+            );
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         }
 
+        dev_info!(self.dev, "verify: MATCH CONFIRMED for user {}!\n", user.value());
         bio::VerifyOutcome::Matched(bio::MatchEvidence::from_enclave_reply(identity))
     }
 
@@ -1389,6 +1423,11 @@ impl SepData {
                 break None;
             }
             if counter >= ENROL_MAX_CAPTURES {
+                dev_err!(
+                    self.dev,
+                    "enrol: reached maximum capture budget ({} attempts) without enclave declaring completion\n",
+                    counter
+                );
                 break Some(Err(ENROL_STATUS_TOO_MANY));
             }
 
@@ -2029,6 +2068,16 @@ impl SepData {
             accepted.min(bio::ENROL_STAGES - 1)
         };
 
+        dev_info!(
+            self.dev,
+            "enrol: capture {} -> progress_raw 0x{:02x} ({}%), has_template {}, complete {}\n",
+            counter,
+            parsed.progress_raw,
+            percent,
+            parsed.has_template(),
+            parsed.complete(),
+        );
+
         ImageOutcome::Progress {
             stage,
             percent,
@@ -2482,6 +2531,12 @@ impl SepData {
         }
         if let Some(e) = delete_all_err {
             return Err(e);
+        }
+
+        if handled.delete_identity.is_some() || !handled.delete_identities.is_empty() {
+            if let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) {
+                let _ = self.save_all_components(user);
+            }
         }
 
         if handled.wake {
