@@ -66,3 +66,29 @@
 &mtp_mt {
 	firmware-name = "apple/tpmtfw-j416c.bin";
 };
+
+/*
+ * From the J416c platform device tree (/arm-io/spi2/mesa): sensor 0x3352 at
+ * 8 MHz, power on gpio0 pin 122 (function-mesa_pwr, active high) and the
+ * data-ready interrupt on gpio0 pin 121, the same lines as J414s.
+ */
+&spi2 {
+	status = "okay";
+
+	mesa: fingerprint@0 {
+		compatible = "apple,mesa-fingerprint";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		spi-cpol;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
+		enable-gpios = <&pinctrl_ap 122 GPIO_ACTIVE_HIGH>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <121 IRQ_TYPE_EDGE_RISING>;
+		/*
+		 * Per-device factory data, extracted from this machine's own macOS
+		 * install; it is not redistributable.
+		 */
+		firmware-name = "apple/mesacal-j416c.bin";
+	};
+};
