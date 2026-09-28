@@ -39,28 +39,28 @@ impl SepData {
         let done = match self.sbio_transfer(op) {
             Ok(done) => done,
             Err(e) => {
-                if op.opcode() == OP_SBIO_BEGIN_ENROL {
-                    dev_err!(self.dev, "enrol: BEGIN_ENROL transfer failed ({:?})\n", e);
-                }
+                dev_err!(self.dev, "sbio: {} transfer failed: {:?}\n", op.name(), e);
                 return SbioOutcome::Other;
             }
         };
 
         let Some(err) = done.status.answered() else {
-            if op.opcode() == OP_SBIO_BEGIN_ENROL {
-                dev_err!(self.dev, "enrol: BEGIN_ENROL reply had no status: {}\n", done.status);
-            }
+            dev_err!(self.dev, "sbio: {} was not answered\n", op.name());
             return SbioOutcome::Other;
         };
 
         match err as u16 {
             crate::sbio::SBIO_STATUS_OK => SbioOutcome::Ok(done.payload),
-            crate::sbio::SBIO_STATUS_PREREQUISITE => SbioOutcome::PrerequisiteMissing,
-            crate::sbio::SBIO_STATUS_16 => SbioOutcome::Status16,
+            crate::sbio::SBIO_STATUS_PREREQUISITE => {
+                dev_err!(self.dev, "sbio: {} refused: status {:#x} (prerequisite missing)\n", op.name(), err);
+                SbioOutcome::PrerequisiteMissing
+            }
+            crate::sbio::SBIO_STATUS_16 => {
+                dev_err!(self.dev, "sbio: {} refused: status {:#x}\n", op.name(), err);
+                SbioOutcome::Status16
+            }
             _ => {
-                if op.opcode() == OP_SBIO_BEGIN_ENROL {
-                    dev_err!(self.dev, "enrol: BEGIN_ENROL replied with status 0x{:x}\n", err);
-                }
+                dev_err!(self.dev, "sbio: {} refused: status {:#x}, payload {} bytes\n", op.name(), err, done.payload.len());
                 SbioOutcome::Other
             }
         }
@@ -1451,6 +1451,13 @@ impl SepData {
                     // completion is the flag at offset 0xbfe, not a derived stage count
                     if complete {
                         if !has_template {
+                            dev_err!(
+                                self.dev,
+                                "enrol: enclave flags completion after {} capture(s) (stage {}, {}%) but reports no template\n",
+                                counter,
+                                stage,
+                                percent
+                            );
                             break Some(Err(ENROL_STATUS_ENCLAVE));
                         }
                         enrolment_completed = true;
@@ -2050,7 +2057,12 @@ impl SepData {
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
         let Some(parsed) = crate::sbio::EnrolmentResult::parse(&result) else {
-            dev_err!(self.dev, "enrol: malformed enrolment result ({} bytes)\n", result.len());
+            dev_err!(
+                self.dev,
+                "enrol: ENROLMENT_RESULT reply did not parse: {} bytes, head {:02x?}\n",
+                result.len(),
+                &result[..result.len().min(16)]
+            );
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
 
