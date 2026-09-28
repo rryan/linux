@@ -17,6 +17,7 @@ mod fv;
 mod hwrng;
 mod image;
 mod keybag;
+mod keybag_identity;
 mod profile;
 mod proto;
 mod refkey;
@@ -259,6 +260,7 @@ impl CalibrationBlob {
 struct EnrolMaterial {
     special: crate::sks::SpecialHandle,
     secret: Secret,
+    snapshot_identity: Option<keybag::SnapshotIdentity>,
 }
 
 struct ImageContext<'a> {
@@ -583,6 +585,8 @@ struct SepData {
     sbio_ready: Atomic<bool>,
 
     templates_restored: Atomic<bool>,
+    // Provisional cold restore; COMPLETE_INIT must still prove the device view.
+    cold_restore_candidate: Atomic<bool>,
 
     sensor_calibrated: Atomic<bool>,
 
@@ -797,6 +801,7 @@ impl SepData {
                 enrol_open: Atomic::new(false),
                 sensor_calibrated: Atomic::new(false),
                 templates_restored: Atomic::new(false),
+                cold_restore_candidate: Atomic::new(false),
                 enrol_material <- new_mutex!(None),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),
                 last_capture_end_ns: Atomic::new(0),
@@ -1118,11 +1123,15 @@ impl SepData {
     }
 
     fn survey_hwrng(&self) -> Result<()> {
-        // A working control endpoint must answer four consecutive draws before
-        // it is exposed to the kernel RNG core. Early attach can beat the SEP
-        // endpoint exchange, so this runs only after that exchange settles.
+        // Successful transport is not proof of entropy: J313/13.5 has returned
+        // four zero words here. Do not advertise that source to the RNG core.
+        // This is a minimal sanity check, not a complete RNG health test.
+        let mut any_bits = 0u32;
         for _ in 0..4 {
-            let _ = self.get_entropy_word()?;
+            any_bits |= self.get_entropy_word()?;
+        }
+        if any_bits == 0 {
+            return Err(EIO);
         }
         self.register_hwrng()
     }
@@ -2262,6 +2271,10 @@ module! {
         probe_owner_export: u8 {
             default: 0,
             description: "Opt-in J414s diagnostic: with zero live identities, select the system context and try saving the missing owner Catacomb",
+        },
+        refkey_v2: u8 {
+            default: 0,
+            description: "Explicit recovery slot for a new identity-bag context; preserves the original machine ref-key",
         },
         j414s_persistent_enrol: u8 {
             default: 0,

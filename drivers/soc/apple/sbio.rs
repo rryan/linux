@@ -365,12 +365,10 @@ impl SepData {
             }
         }
 
-        // The J414s owner exported successfully from state 0x3 in a bounded
-        // no-finger probe, although an earlier pre-UUID boot saw the master
-        // refuse an early save from the same state. Keep this path opt-in
-        // until a new enrollment and reboot prove that the owner blob belongs
-        // to the new user context.
-        if *module_parameters::j414s_persistent_enrol.value() != 0 {
+        // J313 and J414s need an owner export even though state 0x3 has no
+        // save-pending bit. Both restored a fresh enrollment after this export
+        // and user-before-master completion. Other profiles remain opt-in.
+        if self.profile.persistent_enrol || *module_parameters::j414s_persistent_enrol.value() != 0 {
             if owner_initial_state == Some(0x3)
                 && !self.save_catacomb(
                     crate::sbio::CatacombUser::OWNER,
@@ -759,7 +757,7 @@ impl SepData {
     }
 
     fn save_all_components(&self, user: crate::sbio::UserId) -> bool {
-        if *module_parameters::j414s_persistent_enrol.value() != 0 {
+        if self.profile.persistent_enrol || *module_parameters::j414s_persistent_enrol.value() != 0 {
             return self.save_all_components_user_first(user);
         }
         // On m2fix11, a completed enrollment marked both master and user 0x7,
@@ -826,9 +824,8 @@ impl SepData {
             dev_err!(self.dev, "enrol: opt-in completion has no owner Catacomb file\n");
             return false;
         }
-        // Post-match persistence saves the user before the master because the
-        // user save can change system material. Test that order for a completed
-        // J414s enrollment, without changing the default path on other Macs.
+        // Saving the user can change system material. Persist it before the
+        // master, as in the reboot-tested J313/J414s enrollment paths.
         for (who, kind, what) in [
             (
                 crate::sbio::CatacombUser::enrolling(user),
@@ -1004,6 +1001,30 @@ impl SepData {
         self.register_ool(&self.ool_sbio)?;
 
         self.sbio_ready.store(true, Relaxed);
+        if matches!(self.profile.key_store, profile::KeyStore::Sepos13 { .. }) {
+            // 22G74 AppleMesaSEPDriver::initSbioCommunication sends 0x73
+            // with u32(1) before its first ordinary SBIO transaction.
+            // Without it, J313 can complete sensor setup and authenticate
+            // its SCRD context but rejects BEGIN_ENROL. Buffer readiness is
+            // required by this transaction; revoke it if initialization fails.
+            let result = self.sbio_transfer_raw(0x73, c"INIT_SBIO_COMMUNICATION", &1u32.to_le_bytes());
+            match result {
+                Ok(done) if done.status.is_ok() && done.payload.is_empty() => {
+                    dev_info!(self.dev, "sbio: native 13.5 communication initialization accepted\n");
+                }
+                Ok(done) => {
+                    self.sbio_ready.store(false, Relaxed);
+                    dev_err!(self.dev, "sbio: communication init refused, status {} response {}; aborting Touch ID setup\n",
+                        done.status, done.payload.len());
+                    return Err(EIO);
+                }
+                Err(e) => {
+                    self.sbio_ready.store(false, Relaxed);
+                    dev_err!(self.dev, "sbio: communication init transport failed {:?}; aborting Touch ID setup\n", e);
+                    return Err(e);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1165,9 +1186,9 @@ impl SepData {
         })?;
         self.sks_designate_user_keybag(handle, stored.secret());
         self.sks_machine_refkey(handle, stored.secret());
-        let prepared = self.cold_match_continue(handle, uuid);
-        self.attach_bringup();
+        let prepared = self.cold_match_continue(handle, uuid, stored.uuid_provenance());
         self.ensure_restored_after(prepared);
+        self.attach_bringup();
         self.probe_owner_export();
         self.touchid_started.store(true, Relaxed);
         Ok(())
@@ -1469,7 +1490,13 @@ impl SepData {
             let _ = self.log_identity_count(c"after CLEAR_STATE for sensor re-registration");
         }
 
-        if stage == BRINGUP_FRESH {
+        if stage == BRINGUP_FRESH
+            && matches!(self.profile.key_store, profile::KeyStore::Sepos13 { .. })
+        {
+            // The 13.5 J313 flow begins with REGISTER_SENSOR_SERIAL (0x17).
+            // The newer REGISTER_SENSOR (0x80) returned 0x16 on this firmware.
+            self.bringup.store(BRINGUP_IDENTIFIED, Relaxed);
+        } else if stage == BRINGUP_FRESH {
             let op = crate::sbio::sbio_register_sensor(id);
             match self.sbio_call(&op) {
                 SbioOutcome::Ok(_payload) => {
@@ -1655,7 +1682,9 @@ impl SepData {
                 Some(0) => {
                     self.templates_restored.store(false, Relaxed);
                 }
-                Some(n) if self.templates_restored.load(Relaxed) && self.prove_restore() => {
+                Some(n) if (self.templates_restored.load(Relaxed)
+                    || self.cold_restore_candidate.load(Relaxed)) && self.prove_restore() => {
+                    self.templates_restored.store(true, Relaxed);
                     dev_warn!(
                         self.dev,
                         "Touch ID: restored {} enrolled identity/identities; enrolment survived reboot\n",
@@ -2400,13 +2429,13 @@ impl SepData {
 
     fn mint_token_bytes(&self) -> Option<[u8; bio::TOKEN_LEN]> {
         let mut bytes = [0u8; bio::TOKEN_LEN];
-        for chunk in bytes.chunks_mut(4) {
-            match self.get_entropy_word() {
-                Ok(word) => chunk.copy_from_slice(&word.to_le_bytes()[..chunk.len()]),
-                Err(_) => {
-                    return None;
-                }
-            }
+        // This is a host-issued, per-operation capability, not SEP match
+        // evidence. Use the initialized kernel CSPRNG, as for other host
+        // secrets, rather than trusting firmware control replies as entropy.
+        // J313/13.5 answered those draws with zero and caused valid matches
+        // to carry an invalid all-zero token to userspace.
+        if shim::random_bytes(&mut bytes).is_err() || bytes.iter().all(|b| *b == 0) {
+            return None;
         }
         Some(bytes)
     }
@@ -2502,9 +2531,18 @@ impl SepData {
             if let Some(user) = crate::sks::DesignateUser::new(SBIO_PROBE_USER_ID) {
                 let special = user.special_handle();
                 if let Ok(keybag::State::Present(stored)) = keybag::read(keybag::Slot::Identity) {
-                    unlocked = self.sks_step(crate::sks::SKS_LOCK_STATE_NAME, |healthy| {
-                        self.sks_req_unlock_special(special, stored.secret(), healthy)
-                    }).is_some();
+                    unlocked = match self.profile.key_store {
+                        profile::KeyStore::Sepos13 { .. } => self
+                            .sks_step(c"DEVICE_STATE_TRANSITION", |healthy| {
+                                self.sks_req_unlock_special(special, stored.secret(), healthy)
+                            })
+                            .is_some(),
+                        profile::KeyStore::Variant5 => self
+                            .sks_step(crate::sks::SKS_LOCK_STATE_NAME, |healthy| {
+                                self.sks_req_unlock_special(special, stored.secret(), healthy)
+                            })
+                            .is_some(),
+                    };
                 }
             }
         }
@@ -2517,17 +2555,20 @@ impl SepData {
         dev_info!(self.dev, "sbio: cold-match preparation {}, component restore {}\n", prepared, restored);
         let identities = self.log_identity_count(c"after Catacomb restore with sensor registered");
         let identity_ready = matches!(identities, Some(n) if n > 0);
-        let ready = prepared && match_context && restored && identity_ready
-            && self.device_view_synced.load(Relaxed) && self.prove_restore();
-        self.templates_restored.store(ready, Relaxed);
-        if !ready {
+        let candidate = prepared && match_context && restored && identity_ready;
+        self.cold_restore_candidate.store(candidate, Relaxed);
+        // COMPLETE_INIT has not synchronized the device view yet. Never make
+        // verification available on the preliminary Catacomb proof alone;
+        // complete_bringup finishes the proof and sets templates_restored.
+        self.templates_restored.store(false, Relaxed);
+        if !candidate {
             dev_err!(
                 self.dev,
-                "matching unavailable this boot: cold-match preparation, SCRD credential, Catacomb restore, device view, or identity proof did not complete; template state is unproven\n"
+                "matching unavailable this boot: cold-match preparation, SCRD credential, Catacomb restore, or identity proof did not complete; template state is unproven\n"
             );
             return;
         }
-        self.reconcile_identities();
+        dev_info!(self.dev, "sbio: cold restore candidate ready; waiting for device-view proof\n");
 
     }
 
@@ -2535,6 +2576,7 @@ impl SepData {
         &self,
         source: crate::sks::KeyBagHandle,
         uuid: [u8; keybag::UUID_LEN],
+        provenance: keybag::UuidProvenance,
     ) -> bool {
         if !self.keybag_designated.load(Relaxed) {
             return false;
@@ -2544,39 +2586,49 @@ impl SepData {
             return false;
         };
         let special = user.special_handle();
-        // identity_load ends with the source unload (0xfffffe000994bad4);
-        // 13.5 sends nothing between its 0x0d and that unload.
-        if self.profile.key_store != profile::KeyStore::Variant5 {
-            return self.sks_send(self.sks_req_unload_keybag(source)).is_some();
-        }
         self.log_identity_count(c"before the cold-match preparation");
 
+        let Some(source_uuid) = self.sks_read_uuid(source) else {
+            return false;
+        };
+        let generated_lookup = matches!(self.profile.key_store, profile::KeyStore::Sepos13 { .. })
+            && provenance == keybag::UuidProvenance::AsGenerated;
+        let Some(identity) = keybag::SnapshotIdentity::from_loaded(
+            uuid, provenance, source_uuid, generated_lookup,
+        ) else {
+            dev_err!(self.dev, "sks: recovered source bag does not match its stored identity\n");
+            return false;
+        };
         let uuid_ok = self
             .sks_send(self.sks_req_copy_uuid_special(special))
             .and_then(|out| self.sks_uuid_from_reply(&out));
-        match uuid_ok {
-            Some(got) if got == uuid => {}
-            Some(_) => {
-                return false;
-            }
-            None => {
-                return false;
-            }
+        if !uuid_ok.is_some_and(|got| identity.accepts(&uuid, provenance, &got)) {
+            dev_err!(self.dev, "sks: designated bag does not match the recovered source bag\n");
+            return false;
         }
 
         if self.sks_send(self.sks_req_unload_keybag(source)).is_none() {
             return false;
         }
 
+        let mut material = self.enrol_material.lock();
+        let Some(material) = &mut *material else {
+            return false;
+        };
+        material.snapshot_identity = Some(identity);
+        dev_info!(self.dev, "sks: snapshot identity bound to recovered and designated bag; generated lookup {}\n", generated_lookup);
+
         true
     }
 
     pub(crate) fn sep_random(&self, buf: &mut [u8]) -> Result<()> {
-        for chunk in buf.chunks_mut(4) {
-            let word = self.get_entropy_word()?;
-            let bytes = word.to_le_bytes();
-            let take = chunk.len();
-            chunk.copy_from_slice(&bytes[..take]);
+        // The trusted-key framework asks for a fresh plaintext key before
+        // passing it to SEP for sealing. The host CSPRNG is appropriate for
+        // that key; J313/13.5's unverified SEP control entropy replies have
+        // returned all zeros and must not be used as key material.
+        shim::random_bytes(buf)?;
+        if !buf.is_empty() && buf.iter().all(|b| *b == 0) {
+            return Err(EIO);
         }
         Ok(())
     }

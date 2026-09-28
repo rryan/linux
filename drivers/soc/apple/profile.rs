@@ -139,6 +139,8 @@ pub(crate) struct PlatformProfile {
     pub(crate) keybag_create: KeybagCreate,
     /// Key-store protocol generation (see [`KeyStore`]).
     pub(crate) key_store: KeyStore,
+    /// Platforms with reboot-tested owner export and user-before-master saves.
+    pub(crate) persistent_enrol: bool,
 }
 
 const T8103: PlatformProfile = PlatformProfile {
@@ -171,6 +173,7 @@ const T8103: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Sepos13 {
         cpx_encryption_mode: 2,
     },
+    persistent_enrol: true,
 };
 
 const T6020: PlatformProfile = PlatformProfile {
@@ -199,12 +202,15 @@ const T6020: PlatformProfile = PlatformProfile {
         arg: -1,
     },
     key_store: KeyStore::Variant5,
+    persistent_enrol: true,
 };
 
 /// MacBook Neo. The J700 ADT records a pre-booted SEP, a spi2 Mesa sensor
 /// (0x3356), and a SEP DART aperture above 4 GiB. These values describe that
 /// board; device-tree nodes remain authoritative for addresses and resources.
 const T8140: PlatformProfile = PlatformProfile {
+    key_store: KeyStore::Variant5,
+    persistent_enrol: false,
     name: "T8140/J700",
     shmem_capacity: 0x4_0000,
     shmem_first_item: b"CINP",

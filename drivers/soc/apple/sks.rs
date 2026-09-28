@@ -777,6 +777,7 @@ impl SepData {
         *self.enrol_material.lock() = Some(EnrolMaterial {
             special,
             secret: Secret(copy),
+            snapshot_identity: None,
         });
     }
 
@@ -882,11 +883,15 @@ impl SepData {
         &self,
         stored: &keybag::StoredKeyBag,
     ) -> Option<(crate::sks::KeyBagHandle, [u8; keybag::UUID_LEN])> {
-        // 13.5 keeps the identity bag in the enclave: identity_open
-        // (0xfffffe000994b0e4) loads it by its 16-byte UUID (0x…b11c-b124).
-        let key = match self.profile.key_store {
-            profile::KeyStore::Sepos13 { .. } => &stored.uuid()[..],
-            profile::KeyStore::Variant5 => stored.wrapped(),
+        // 13.5 identity_open addresses an enclave-resident identity bag by
+        // its generated UUID. Older J313 records instead store the bag's
+        // read-back UUID and a wrapped bag, which must be loaded as a blob.
+        let uuid_load = matches!(self.profile.key_store, profile::KeyStore::Sepos13 { .. })
+            && stored.uuid_provenance() == keybag::UuidProvenance::AsGenerated;
+        let key = if uuid_load {
+            &stored.uuid()[..]
+        } else {
+            stored.wrapped()
         };
         let request = match self.sks_req_load_keybag(key) {
             Ok(request) => request,
@@ -950,9 +955,7 @@ impl SepData {
         }
         let handle = crate::sks::KeyBagHandle::from_load_reply(handle);
 
-        // identity_load sends 0x0d straight after the load (0x…ba5c) and
-        // reads no UUID back.
-        if self.profile.key_store != profile::KeyStore::Variant5 {
+        if uuid_load {
             return Some((handle, *stored.uuid()));
         }
 
@@ -977,12 +980,16 @@ impl SepData {
     }
 
     pub(crate) fn resnapshot_identity_keybag(&self) -> bool {
-        let special = {
+        let (special, identity) = {
             let material = self.enrol_material.lock();
             let Some(material) = material.as_ref() else {
                 return false;
             };
-            material.special
+            let Some(identity) = material.snapshot_identity else {
+                dev_err!(self.dev, "sks: refusing snapshot without a recovered-bag identity binding\n");
+                return false;
+            };
+            (material.special, identity)
         };
 
         let Some(out) = self.sks_send(self.sks_req_copy_keybag_special(special)) else {
@@ -1000,7 +1007,7 @@ impl SepData {
             return false;
         };
 
-        match keybag::replace_wrapped(keybag::Slot::Identity, &wrapped, &uuid) {
+        match keybag::replace_wrapped(keybag::Slot::Identity, &wrapped, &uuid, &identity) {
             Ok(()) => true,
             Err(e) => {
                 dev_err!(
@@ -1013,7 +1020,7 @@ impl SepData {
         }
     }
 
-    fn sks_read_uuid(&self, handle: crate::sks::KeyBagHandle) -> Option<[u8; keybag::UUID_LEN]> {
+    pub(crate) fn sks_read_uuid(&self, handle: crate::sks::KeyBagHandle) -> Option<[u8; keybag::UUID_LEN]> {
         let out = self.sks_send(self.sks_req_copy_keybag_uuid(handle))?;
         self.sks_uuid_from_reply(&out)
     }
