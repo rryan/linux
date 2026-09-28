@@ -21,18 +21,13 @@
 
 #include "shim.h"
 
-/*
- * 8 MHz, SPI mode 2 (CPOL=1 CPHA=0), 8-bit words. Mode 3 returns sixteen zero
- * bytes, else identical. Must agree with the node's spi-cpol / absent spi-cpha,
- * which is what spi_setup() applies.
- */
+/* Use the board's device-tree mode (J313: 1, J414s: 2). */
 #define SEP_SENSOR_HZ		8000000
 #define SEP_SENSOR_BITS		8
-static unsigned int sep_sensor_mode = SPI_MODE_2;
+static unsigned int sep_sensor_mode = ~0U;
 module_param_named(sensor_spi_mode, sep_sensor_mode, uint, 0444);
 MODULE_PARM_DESC(sensor_spi_mode,
-		 "SPI mode for the sensor: 2 (CPOL=1 CPHA=0, the default and the only mode this sensor answers under) or 3 (CPOL=1 CPHA=1, reads all-zero). For comparison only.");
-#define SEP_SENSOR_MODE		sep_sensor_mode
+		 "Optional diagnostic SPI mode override (0-3); default uses the device tree");
 
 /* Chip-select setup and hold, in ns. */
 #define SEP_SENSOR_CS_NS		20
@@ -216,7 +211,11 @@ static int sep_acquire_power(struct spi_device *spi)
 	    of_property_present(spi->dev.of_node, "apple,smc-power-key"))
 		return sep_acquire_smc_power(spi);
 
-	sep_power = gpiod_get_index(&spi->dev, NULL, 0, GPIOD_OUT_LOW);
+	sep_power = gpiod_get(&spi->dev, "enable", GPIOD_OUT_LOW);
+	if (IS_ERR(sep_power) && PTR_ERR(sep_power) == -ENOENT)
+		sep_power = gpiod_get_index(&spi->dev, NULL, 0, GPIOD_OUT_LOW);
+	if (IS_ERR(sep_power) && PTR_ERR(sep_power) == -EPROBE_DEFER)
+		return -EPROBE_DEFER;
 	if (!IS_ERR(sep_power)) {
 		sep_power_source = SEP_POWER_NODE_PROPERTY;
 		dev_info(&spi->dev,
@@ -334,7 +333,8 @@ static int sep_apply_cs_timing(struct spi_device *spi)
 	if (rc)
 		return rc;
 
-	spi->mode = SEP_SENSOR_MODE;
+	if (sep_sensor_mode <= SPI_MODE_3)
+		spi->mode = sep_sensor_mode;
 	spi->bits_per_word = SEP_SENSOR_BITS;
 	spi->max_speed_hz = SEP_SENSOR_HZ;
 	spi->cs_setup.value = SEP_SENSOR_CS_NS;
