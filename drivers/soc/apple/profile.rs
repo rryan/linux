@@ -8,7 +8,7 @@
 //! here once. The driver reads addresses from the device tree, never scans for
 //! them, and never patches properties at runtime.
 //!
-//! Four bring-up targets are modelled:
+//! Five bring-up targets are modelled:
 //!
 //! * `T8103` / J313 (MacBook Air, M1): the host boots the SEP with the boot
 //!   endpoint handshake over a 0x30000 shared-memory window.
@@ -16,6 +16,8 @@
 //!   key store, with the sensor on the T6020 SPI2 address.
 //! * `T6020` / J414s (MacBook Pro 14", M2 Pro): the driver does the warm
 //!   single-message registration over a 0x40000 window.
+//! * `T6021` / J416c (MacBook Pro 16", M2 Max): the T6020 profile. The J416c
+//!   ADT describes the same pre-booted SEP, key store and SPI2 sensor.
 //! * `T8140` / J700 (MacBook Neo, A18 Pro): iBoot boots sepOS before the AP
 //!   OS, so the driver uses the warm registration path.
 
@@ -280,6 +282,16 @@ const T8140: PlatformProfile = PlatformProfile {
     },
 };
 
+/// M2 Max (J416c). Its ADT matches J414s wherever the profile looks: the SEP
+/// is pre-booted (`sepfw-booted = 1`), `/defaults` carries
+/// `cpx-encryption-mode = 2`, and `/arm-io/spi2/mesa` is sensor 0x3352 at
+/// 8 MHz on the controller at 0x39b108000. The board device tree describes the
+/// sensor's power and data-ready lines.
+const T6021: PlatformProfile = PlatformProfile {
+    name: "T6021/J416c",
+    ..T6020
+};
+
 static_assert!(T8103.shmem_capacity == 0x30000);
 static_assert!(T6020.shmem_capacity == 0x40000);
 static_assert!(T8140.shmem_capacity == 0x40000);
@@ -327,6 +339,9 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     }
     if machine_has(b"apple,t6020") {
         return Ok(&T6020);
+    }
+    if machine_has(b"apple,t6021") {
+        return Ok(&T6021);
     }
     if machine_has(b"apple,t6000") {
         return Ok(&T6000);
