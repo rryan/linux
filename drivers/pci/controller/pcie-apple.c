@@ -65,6 +65,22 @@ static int link_up_timeout = 500;
 module_param(link_up_timeout, int, 0644);
 MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 
+static bool tunnel_kernel_init;
+module_param(tunnel_kernel_init, bool, 0644);
+MODULE_PARM_DESC(tunnel_kernel_init,
+		 "Cold-initialize apple,pciec-kernel-init PCIe-C ports on t600x/t602x (experimental; always on for t8103)");
+
+/*
+ * t8103 has no PCIe-C handoff, so its kernel-init ports are always brought
+ * up by the kernel. On t600x/t602x m1n1 may own the cold init, so the
+ * in-kernel sequence there is opt-in.
+ */
+static bool apple_pcie_tunnel_kernel_init_allowed(struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t8103-pciec") ||
+	       READ_ONCE(tunnel_kernel_init);
+}
+
 /* T8103 (original M1) and related SoCs */
 #define CORE_RC_PHYIF_CTL		0x00024
 #define   CORE_RC_PHYIF_CTL_RUN		BIT(0)
@@ -1953,7 +1969,9 @@ static int apple_pcie_tunnel_init_resources(struct platform_device *pdev,
 	if (!config || !debug || !fabric)
 		return dev_err_probe(pcie->dev, -ENODEV,
 				     "PCIe-C resume resources are incomplete\n");
-	if (pcie->kernel_init && !oe_fabric)
+	/* t8103 needs oe-fabric for cold init; t602x has no such region. */
+	if (pcie->kernel_init && !oe_fabric &&
+	    of_device_is_compatible(pcie->dev->of_node, "apple,t8103-pciec"))
 		return dev_err_probe(pcie->dev, -ENODEV,
 				     "PCIe-C oe-fabric region is required\n");
 
@@ -2349,7 +2367,8 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		return PTR_ERR(pcie->base);
 	if (pcie->hw->tunneled) {
 		pcie->kernel_init = of_property_read_bool(dev->of_node,
-							  "apple,pciec-kernel-init");
+							  "apple,pciec-kernel-init") &&
+				    apple_pcie_tunnel_kernel_init_allowed(dev->of_node);
 		ret = apple_pcie_tunnel_init_resources(pdev, pcie);
 		if (ret)
 			return ret;
@@ -2704,12 +2723,21 @@ int apple_pcie_tunnel_prepare(struct device *dev, struct device_node *tunnel)
 
 	np = NULL;
 	for_each_available_child_of_node(tunnel, np) {
-		if (of_device_is_compatible(np, "apple,t8103-pciec") &&
+		if ((of_device_is_compatible(np, "apple,t8103-pciec") ||
+		     of_device_is_compatible(np, "apple,t6000-pciec")) &&
 		    of_property_read_bool(np, "apple,pciec-kernel-init"))
 			break;
 	}
 	if (!np)
 		return 0;
+
+	if (!apple_pcie_tunnel_kernel_init_allowed(np)) {
+		dev_err(dev,
+			"PCIe-C %pOF: kernel init disabled (pcie_apple.tunnel_kernel_init=0)\n",
+			np);
+		ret = -EPERM;
+		goto out_np;
+	}
 
 	match = of_match_node(apple_pcie_of_match, np);
 	if (!match) {
@@ -2738,9 +2766,12 @@ int apple_pcie_tunnel_prepare(struct device *dev, struct device_node *tunnel)
 	ret = apple_pcie_map_named(np, "fabric", &fabric);
 	if (ret)
 		goto out_np;
-	ret = apple_pcie_map_named(np, "oe-fabric", &oe);
-	if (ret)
-		goto out_np;
+	/* Not every SoC has an oe-fabric region (t602x does not). */
+	if (of_property_match_string(np, "reg-names", "oe-fabric") >= 0) {
+		ret = apple_pcie_map_named(np, "oe-fabric", &oe);
+		if (ret)
+			goto out_np;
+	}
 
 	port_np = of_get_next_available_child(np, NULL);
 	if (!port_np) {
@@ -2783,13 +2814,15 @@ int apple_pcie_tunnel_prepare(struct device *dev, struct device_node *tunnel)
 		pcie->rc_tunable = NULL;
 		goto out_free;
 	}
-	pcie->oe_fabric_tunable = apple_pcie_tunable_once(np,
-							 "apple,tunable-oe-fabric",
-							 &oe.res);
-	if (IS_ERR(pcie->oe_fabric_tunable)) {
-		ret = PTR_ERR(pcie->oe_fabric_tunable);
-		pcie->oe_fabric_tunable = NULL;
-		goto out_free;
+	if (oe.base) {
+		pcie->oe_fabric_tunable =
+			apple_pcie_tunable_once(np, "apple,tunable-oe-fabric",
+						&oe.res);
+		if (IS_ERR(pcie->oe_fabric_tunable)) {
+			ret = PTR_ERR(pcie->oe_fabric_tunable);
+			pcie->oe_fabric_tunable = NULL;
+			goto out_free;
+		}
 	}
 
 	port->pcie = pcie;
@@ -3030,6 +3063,18 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		/* Lost while asleep: take the same path as a stopped tunnel. */
 		dev_warn(dev, "PCIe-C link lost during suspend-to-idle\n");
 		apple_pcie_stop_for_sleep(dev);
+	}
+	/*
+	 * The NHI resumes first. If the USB4 router was lost during suspend,
+	 * its teardown has already quiesced this host. Resetting or starting
+	 * the ports now would train against a tunnel that no longer exists,
+	 * which on J416c leaves them unable to link on every later connect;
+	 * apple_pcie_tunnel_restore() starts them once a new tunnel is up.
+	 */
+	if (pcie->bus_stopped) {
+		pcie->reset_on_resume = false;
+		dev_info(dev, "PCIe-C tunnel lost during suspend, not restarting\n");
+		return 0;
 	}
 	if (pcie->reset_on_resume) {
 		pcie->reset_on_resume = false;
