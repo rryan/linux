@@ -70,6 +70,13 @@ module_param(tunnel_kernel_init, bool, 0644);
 MODULE_PARM_DESC(tunnel_kernel_init,
 		 "Cold-initialize apple,pciec-kernel-init PCIe-C ports on t600x/t602x (experimental; always on for t8103)");
 
+static bool tunnel_wake;
+module_param(tunnel_wake, bool, 0444);
+MODULE_PARM_DESC(tunnel_wake,
+		 "Let tunneled endpoints use D3hot so they can signal PME wakeups (experimental)");
+
+static int apple_pcie_tunnel_keep_d0(struct pci_dev *pdev, void *data);
+
 /*
  * t8103 has no PCIe-C handoff, so its kernel-init ports are always brought
  * up by the kernel. On t600x/t602x m1n1 may own the cold init, so the
@@ -120,6 +127,7 @@ static bool apple_pcie_tunnel_kernel_init_allowed(struct device_node *np)
 #define   PORT_INT_LINK_UP		12
 #define   PORT_INT_LINK_BWMGMT		11
 #define   PORT_INT_AER_MASK		(15 << 4)
+#define   PORT_INT_PME			8	/* root port latched a PME message */
 #define   PORT_INT_PORT_ERR		4
 #define   PORT_INT_INTx(i)		i
 #define   PORT_INT_INTx_MASK		15
@@ -308,7 +316,9 @@ struct apple_pcie_port {
 	u32			*saved_rid2sid;
 	struct apple_tunable	*tunable;
 	unsigned int		irq;
-	unsigned int		link_irqs[2];
+	unsigned int		link_irqs[3];
+	unsigned int		pme_irq;
+	struct pci_dev		*root_port;
 	u32			saved_intmask;
 	int			sid_map_sz;
 	int			idx;
@@ -663,6 +673,19 @@ static irqreturn_t apple_pcie_port_irq(int irq, void *data)
 	unsigned int hwirq = irq_domain_get_irq_data(port->domain, irq)->hwirq;
 
 	switch (hwirq) {
+	case PORT_INT_PME: {
+		struct pci_dev *rp = READ_ONCE(port->root_port);
+		unsigned int pme_irq = rp ? READ_ONCE(rp->irq) : 0;
+
+		/*
+		 * The root port latches PME Status but never sends its own
+		 * PME MSI. Hand the event to the PME service on that MSI, so
+		 * it resumes the requester, and wakes the system if armed.
+		 */
+		if (pme_irq)
+			generic_handle_irq(pme_irq);
+		break;
+	}
 	case PORT_INT_LINK_UP:
 		dev_info_ratelimited(port->pcie->dev, "Link up on %pOF\n",
 				     port->np);
@@ -691,9 +714,12 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 	static struct {
 		unsigned int	hwirq;
 		const char	*name;
+		unsigned long	flags;
 	} port_irqs[] = {
-		{ PORT_INT_LINK_UP,	"Link up",	},
-		{ PORT_INT_LINK_DOWN,	"Link down",	},
+		{ PORT_INT_LINK_UP,	"Link up",	0,		},
+		{ PORT_INT_LINK_DOWN,	"Link down",	0,		},
+		/* Must run during s2idle to forward a wakeup PME. */
+		{ PORT_INT_PME,		"PME",		IRQF_NO_SUSPEND,	},
 	};
 	int i;
 
@@ -707,12 +733,16 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 		};
 		int irq, ret;
 
+		/* Only seen on the PCIe-C tunnel ports so far. */
+		if (port_irqs[i].hwirq == PORT_INT_PME && !port->pcie->hw->tunneled)
+			continue;
+
 		irq = irq_domain_alloc_irqs(port->domain, 1, NUMA_NO_NODE,
 					    &fwspec);
 		if (irq <= 0)
 			return irq ?: -ENOMEM;
 
-		ret = request_irq(irq, apple_pcie_port_irq, 0,
+		ret = request_irq(irq, apple_pcie_port_irq, port_irqs[i].flags,
 				  port_irqs[i].name, port);
 		if (ret) {
 			irq_domain_free_irqs(irq, 1);
@@ -720,6 +750,8 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 		}
 
 		port->link_irqs[i] = irq;
+		if (port_irqs[i].hwirq == PORT_INT_PME)
+			port->pme_irq = irq;
 	}
 
 	return 0;
@@ -737,6 +769,7 @@ static void apple_pcie_port_unregister_irqs(struct apple_pcie_port *port)
 		irq_domain_free_irqs(port->link_irqs[i], 1);
 		port->link_irqs[i] = 0;
 	}
+	port->pme_irq = 0;
 }
 
 static u32 apple_pcie_rid2sid_write(struct apple_pcie_port *port,
@@ -1762,6 +1795,21 @@ static struct apple_pcie_port *apple_pcie_get_port(struct pci_dev *pdev)
 	return NULL;
 }
 
+/* The port a root port itself belongs to; apple_pcie_get_port() skips those. */
+static struct apple_pcie_port *apple_pcie_root_port_port(struct pci_dev *pdev)
+{
+	struct pci_config_window *cfg = pdev->sysdata;
+	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
+	struct apple_pcie_port *port;
+
+	if (!pcie)
+		return NULL;
+	list_for_each_entry(port, &pcie->ports, entry)
+		if (port->idx == PCI_SLOT(pdev->devfn))
+			return port;
+	return NULL;
+}
+
 static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
@@ -1772,7 +1820,15 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 
 	/* Also cover functions discovered by a later hotplug or rescan. */
 	if (pcie->hw->tunneled)
-		pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
+		apple_pcie_tunnel_keep_d0(pdev, NULL);
+
+	/* The root port's PME vector, for forwarding port PME events. */
+	if (pci_pcie_type(pdev) == PCI_EXP_TYPE_ROOT_PORT) {
+		struct apple_pcie_port *rp_port = apple_pcie_root_port_port(pdev);
+
+		if (rp_port && !rp_port->root_port)
+			WRITE_ONCE(rp_port->root_port, pci_dev_get(pdev));
+	}
 
 	/*
 	 * Endpoint BARs share PCIe-C's tunneled, non-posted MMIO fabric. Mark
@@ -1839,6 +1895,16 @@ static void apple_pcie_disable_device(struct pci_host_bridge *bridge, struct pci
 	struct apple_pcie_port *port;
 	u32 rid = pci_dev_id(pdev);
 	int idx;
+
+	if (pci_pcie_type(pdev) == PCI_EXP_TYPE_ROOT_PORT) {
+		port = apple_pcie_root_port_port(pdev);
+		if (port && port->root_port == pdev) {
+			WRITE_ONCE(port->root_port, NULL);
+			if (port->pme_irq)
+				synchronize_irq(port->pme_irq);
+			pci_dev_put(pdev);
+		}
+	}
 
 	port = apple_pcie_get_port(pdev);
 	if (!port)
@@ -2116,7 +2182,16 @@ static int apple_pcie_tunnel_keep_d0(struct pci_dev *pdev, void *data)
 	 * is asleep, so a device left in D3hot cannot receive the config write
 	 * that would bring it back to D0.  Quiesce drivers normally, but leave
 	 * PCI power-state ownership to the tunnel across system sleep.
+	 *
+	 * With tunnel_wake, endpoints may still use D3hot: only from D3hot do
+	 * some (e.g. the Titan Ridge xHCI in TB3 docks) send PME, which is what
+	 * lets a dock keyboard wake the system. While the tunnel link is kept
+	 * through suspend-to-idle they stay reachable; when it is stopped,
+	 * resume treats them as coming from D3cold anyway. Bridges stay in D0
+	 * so PME messages can pass through them.
 	 */
+	if (READ_ONCE(tunnel_wake) && !pci_is_bridge(pdev))
+		return 0;
 	pdev->dev_flags |= PCI_DEV_FLAGS_NO_D3;
 	return 0;
 }
