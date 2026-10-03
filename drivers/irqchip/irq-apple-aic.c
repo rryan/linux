@@ -478,6 +478,7 @@ static struct irq_chip aic_chip = {
 	.irq_eoi = aic_irq_eoi,
 	.irq_set_affinity = aic_irq_set_affinity,
 	.irq_set_type = aic_irq_set_type,
+	.flags = IRQCHIP_SKIP_SET_WAKE,
 };
 
 static struct irq_chip aic2_chip = {
@@ -486,6 +487,7 @@ static struct irq_chip aic2_chip = {
 	.irq_unmask = aic_irq_unmask,
 	.irq_eoi = aic_irq_eoi,
 	.irq_set_type = aic_irq_set_type,
+	.flags = IRQCHIP_SKIP_SET_WAKE,
 };
 
 /*

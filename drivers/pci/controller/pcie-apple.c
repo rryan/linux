@@ -431,6 +431,7 @@ static struct irq_chip apple_msi_bottom_chip = {
 	.irq_eoi		= irq_chip_eoi_parent,
 	.irq_set_affinity	= irq_chip_set_affinity_parent,
 	.irq_set_type		= irq_chip_set_type_parent,
+	.irq_set_wake		= irq_chip_set_wake_parent,
 	.irq_compose_msi_msg	= apple_msi_compose_msg,
 };
 
@@ -1641,6 +1642,23 @@ err_teardown:
 	return ret;
 }
 
+/*
+ * The per-device PCI/MSI chips come from the generic template, which has no
+ * irq_set_wake. Forward it to the parent so a wakeup-enabled device (or a
+ * root port's PME interrupt) stays armed through suspend-to-idle.
+ */
+static bool apple_msi_init_dev_msi_info(struct device *dev,
+					struct irq_domain *domain,
+					struct irq_domain *real_parent,
+					struct msi_domain_info *info)
+{
+	if (!msi_lib_init_dev_msi_info(dev, domain, real_parent, info))
+		return false;
+	if (!info->chip->irq_set_wake)
+		info->chip->irq_set_wake = irq_chip_set_wake_parent;
+	return true;
+}
+
 static const struct msi_parent_ops apple_msi_parent_ops = {
 	.supported_flags	= (MSI_GENERIC_FLAGS_MASK	|
 				   MSI_FLAG_PCI_MSIX		|
@@ -1650,7 +1668,7 @@ static const struct msi_parent_ops apple_msi_parent_ops = {
 				   MSI_FLAG_PCI_MSI_MASK_PARENT),
 	.chip_flags		= MSI_CHIP_FLAG_SET_EOI,
 	.bus_select_token	= DOMAIN_BUS_PCI_MSI,
-	.init_dev_msi_info	= msi_lib_init_dev_msi_info,
+	.init_dev_msi_info	= apple_msi_init_dev_msi_info,
 };
 
 static int apple_msi_init(struct apple_pcie *pcie)
