@@ -418,16 +418,24 @@
 	hdmi-hpd-gpios = <&pinctrl_aop 25 GPIO_ACTIVE_HIGH>;
 };
 
+/*
+ * The USB-C port controllers wake the system from suspend-to-idle, so that
+ * plugging in a dock wakes a closed laptop. All four controllers, MagSafe
+ * included, share one interrupt line, so events on any of them wake it.
+ */
 &hpm0 {
 	interrupts = <44 IRQ_TYPE_LEVEL_LOW>;
+	wakeup-source;
 };
 
 &hpm1 {
 	interrupts = <44 IRQ_TYPE_LEVEL_LOW>;
+	wakeup-source;
 };
 
 &hpm2 {
 	interrupts = <44 IRQ_TYPE_LEVEL_LOW>;
+	wakeup-source;
 };
 
 &hpm5 {
