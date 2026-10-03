@@ -2159,8 +2159,14 @@ EXPORT_SYMBOL_GPL(tipd_remove);
 
 int tipd_suspend(struct tps6598x *tps)
 {
+	/*
+	 * Don't disable the interrupt when arming it for wakeup: the CD321x
+	 * controllers on Apple machines share one line, and each instance's
+	 * disable_irq() nests, so the line stays masked through suspend and
+	 * never wakes the system. A wake-armed interrupt does not run its
+	 * handler while suspended; the core replays it on resume.
+	 */
 	if (tps->wakeup) {
-		disable_irq(tps->irq);
 		enable_irq_wake(tps->irq);
 	} else if (tps->reset) {
 		gpiod_set_value_cansleep(tps->reset, 1);
@@ -2189,7 +2195,6 @@ int tipd_resume(struct tps6598x *tps)
 
 	if (tps->wakeup) {
 		disable_irq_wake(tps->irq);
-		enable_irq(tps->irq);
 	} else if (tps->reset) {
 		gpiod_set_value_cansleep(tps->reset, 0);
 		msleep(TPS_SETUP_MS);
