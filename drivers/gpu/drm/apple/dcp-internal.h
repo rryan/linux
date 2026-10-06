@@ -187,8 +187,8 @@ struct apple_dcp {
 	bool pm_bringup;
 	bool crtc_active;
 	bool hdmi_pm_ref;
-	/* Runtime PM supplier link to the PIODMA DART */
-	struct device_link *piodma_dart_link;
+	/* Runtime PM supplier link to the display (scanout and PIODMA) DART */
+	struct device_link *disp_dart_link;
 
 	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 

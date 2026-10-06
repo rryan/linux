@@ -17,6 +17,7 @@
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
+#include <linux/pm_runtime.h>
 #include <linux/soc/apple/dp-tunnel.h>
 
 #include <drm/drm_atomic.h>
@@ -677,6 +678,18 @@ static int apple_drm_init(struct device *dev)
 	ret = component_bind_all(dev, apple);
 	if (ret)
 		return ret;
+
+	/*
+	 * The display subsystem is a virtual device: it only owns the IOMMU
+	 * domain that framebuffers are mapped into, and each DCP scans out
+	 * through its own display DART, which it now holds while it runs.
+	 * Drop the DL_FLAG_RPM_ACTIVE references the IOMMU core took for this
+	 * device, which never runtime suspends to release them, so that the
+	 * DART of a stopped DCP and its power domain can turn off.  Mapping
+	 * into a suspended DART needs no hardware access; its registers are
+	 * restored on resume.
+	 */
+	pm_runtime_set_suspended(dev);
 
 	ret = drmm_mode_config_init(&apple->drm);
 	if (ret)

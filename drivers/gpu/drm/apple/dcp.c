@@ -2724,14 +2724,17 @@ static void dcp_work_update_backlight(struct work_struct *work)
 }
 
 /*
- * The IOMMU core makes piodma a runtime PM consumer of its DART and keeps the
- * DART active (DL_FLAG_RPM_ACTIVE) until piodma runtime suspends.  piodma
- * never binds a driver, so that never happens, and the DART would keep the
- * power domain it shares with an external DCP on for good.  It is the DCP's
- * display engine that uses this DART: make the DART a runtime PM supplier of
- * the DCP instead, and release piodma's hold on it.
+ * The display DART of a DCP translates both the piodma stream and the
+ * scanout stream the display subsystem maps framebuffers into.  It is the
+ * DCP's display engine that uses it, so make it a runtime PM supplier of the
+ * DCP: active for as long as the DCP runs.  The display subsystem lets go of
+ * it once the DCPs are bound (apple_drm_init()).
+ *
+ * The IOMMU core makes piodma a DL_FLAG_RPM_ACTIVE consumer of the DART too,
+ * which only lets go when piodma runtime suspends.  piodma never binds a
+ * driver, so that never happens: release that hold.
  */
-static int dcp_link_piodma_dart(struct apple_dcp *dcp, struct device_node *node)
+static int dcp_link_disp_dart(struct apple_dcp *dcp, struct device_node *node)
 {
 	struct of_phandle_args args;
 	struct platform_device *dart;
@@ -2747,19 +2750,19 @@ static int dcp_link_piodma_dart(struct apple_dcp *dcp, struct device_node *node)
 	if (!dart)
 		return -ENODEV;
 
-	dcp->piodma_dart_link = device_link_add(dcp->dev, &dart->dev,
-						DL_FLAG_STATELESS |
-						DL_FLAG_PM_RUNTIME |
-						DL_FLAG_RPM_ACTIVE);
+	dcp->disp_dart_link = device_link_add(dcp->dev, &dart->dev,
+					      DL_FLAG_STATELESS |
+					      DL_FLAG_PM_RUNTIME |
+					      DL_FLAG_RPM_ACTIVE);
 	put_device(&dart->dev);
-	if (!dcp->piodma_dart_link)
+	if (!dcp->disp_dart_link)
 		return -EINVAL;
 
 	/* Already the status of a driverless device; drops the link references. */
 	ret = pm_runtime_set_suspended(&dcp->piodma->dev);
 	if (ret) {
-		device_link_del(dcp->piodma_dart_link);
-		dcp->piodma_dart_link = NULL;
+		device_link_del(dcp->disp_dart_link);
+		dcp->disp_dart_link = NULL;
 	}
 
 	return ret;
@@ -2798,12 +2801,10 @@ static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 		goto err_destroy_pdev;
 	}
 
-	if (dcp->hw.restartable) {
-		ret = dcp_link_piodma_dart(dcp, node);
-		if (ret) {
-			dev_err(dcp->dev, "Failed to link PIODMA DART: %d\n", ret);
-			goto err_destroy_pdev;
-		}
+	ret = dcp_link_disp_dart(dcp, node);
+	if (ret) {
+		dev_err(dcp->dev, "Failed to link display DART: %d\n", ret);
+		goto err_destroy_pdev;
 	}
 
 	return 0;
@@ -3587,9 +3588,9 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (dcp->hw.restartable)
 		dcp_runtime_pm_release(dcp);
 
-	if (dcp->piodma_dart_link) {
-		device_link_del(dcp->piodma_dart_link);
-		dcp->piodma_dart_link = NULL;
+	if (dcp->disp_dart_link) {
+		device_link_del(dcp->disp_dart_link);
+		dcp->disp_dart_link = NULL;
 	}
 
 	if (dcp->piodma) {
