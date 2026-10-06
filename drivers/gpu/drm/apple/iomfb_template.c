@@ -294,6 +294,7 @@ static struct dcp_map_buf_resp dcpep_cb_map_piodma(struct apple_dcp *dcp,
 		goto reject;
 	}
 
+	memdesc->piodma_mapped = true;
 	return (struct dcp_map_buf_resp){ .dva = memdesc->dva };
 
 reject:
@@ -334,6 +335,7 @@ static void dcpep_cb_unmap_piodma(struct apple_dcp *dcp,
 	 *       full pages
 	 */
 	iommu_unmap(dcp->iommu_dom, memdesc->dva, ALIGN(memdesc->size, SZ_16K));
+	memdesc->piodma_mapped = false;
 }
 
 /*
@@ -380,8 +382,6 @@ dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 
 static u8 dcpep_cb_release_mem_desc(struct apple_dcp *dcp, u32 *mem_desc_id)
 {
-	struct dcp_mem_descriptor *memdesc;
-	size_t size;
 	u32 id = *mem_desc_id;
 
 	if (id >= DCP_MAX_MAPPINGS) {
@@ -390,23 +390,13 @@ static u8 dcpep_cb_release_mem_desc(struct apple_dcp *dcp, u32 *mem_desc_id)
 		return 0;
 	}
 
-	if (!test_and_clear_bit(id, dcp->memdesc_map)) {
+	if (!test_bit(id, dcp->memdesc_map)) {
 		dev_warn(dcp->dev, "unmap request for unused mem_desc_id %u\n",
 			 id);
 		return 0;
 	}
 
-	memdesc = &dcp->memdesc[id];
-	size = ALIGN(memdesc->size, SZ_16K);
-	if (memdesc->buf) {
-		dma_free_coherent(dcp->dev, size, memdesc->buf, memdesc->dva);
-		memdesc->buf = NULL;
-		memset(&memdesc->map, 0, sizeof(memdesc->map));
-	} else {
-		memdesc->reg = 0;
-	}
-
-	memdesc->size = 0;
+	dcp_memdesc_release(dcp, id);
 
 	return 1;
 }
@@ -452,6 +442,8 @@ dcpep_cb_map_physical(struct apple_dcp *dcp, struct dcp_map_physical_req *req)
 
 	dva = dma_map_resource(dcp->dev, req->paddr, size, DMA_BIDIRECTIONAL, 0);
 	WARN_ON(dva == DMA_MAPPING_ERROR);
+	if (dva != DMA_MAPPING_ERROR)
+		dcp->memdesc[id].dva = dva;
 
 	return (struct dcp_map_physical_resp){
 		.dva_size = size,
@@ -476,9 +468,17 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 	} else {
 		struct resource *rsrc = dcp->disp_registers[req->index];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-		dma_addr_t dva = dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
-						  DMA_BIDIRECTIONAL, 0);
-		WARN_ON(dva == DMA_MAPPING_ERROR);
+		dma_addr_t dva = dcp->disp_reg_dva[req->index];
+
+		/* The mapping lasts until the firmware stops: reuse it. */
+		if (!dva) {
+			dva = dma_map_resource(dcp->dev, rsrc->start,
+					       resource_size(rsrc),
+					       DMA_BIDIRECTIONAL, 0);
+			WARN_ON(dva == DMA_MAPPING_ERROR);
+			if (dva != DMA_MAPPING_ERROR)
+				dcp->disp_reg_dva[req->index] = dva;
+		}
 #endif
 
 		return (struct DCP_FW_NAME(dcp_map_reg_resp)){
@@ -1556,6 +1556,22 @@ void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp)
 	struct dcp_set_power_state_req req = {
 		/* defaults are ok */
 	};
+	struct dcp_wait_cookie *cookie;
 
-	dcp_set_power_state(dcp, false, &req, NULL, NULL);
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie) {
+		dcp_set_power_state(dcp, false, &req, NULL, NULL);
+		return;
+	}
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	/* increase refcount to ensure the receiver has a reference */
+	kref_get(&cookie->refcount);
+
+	/* RTKit is stopped next: let IOMFB power down first. */
+	dcp_set_power_state(dcp, false, &req, complete_set_powerstate, cookie);
+	if (!wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000)))
+		dev_warn(dcp->dev, "setPowerState(0) on shutdown timed out\n");
+
+	kref_put(&cookie->refcount, release_wait_cookie);
 }

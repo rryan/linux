@@ -2943,45 +2943,87 @@ static int dcp_rtkit_start(struct apple_dcp *dcp)
 
 static void dcp_rtkit_stop(struct apple_dcp *dcp)
 {
+	int ret;
+
 	if (!dcp->rtk)
 		return;
 
-	apple_rtkit_free(dcp->rtk);
+	/* The internal DCP keeps running once RTKit lets go of it. */
+	if (!dcp->hw.restartable) {
+		apple_rtkit_free(dcp->rtk);
+		dcp->rtk = NULL;
+		return;
+	}
+
+	/*
+	 * Put the firmware to sleep and stop the CPU, as m1n1 does before it
+	 * hands an external DCP over (dcp_shutdown(), rtkit_sleep()).
+	 */
+	ret = dcp->crashed ? -ENODEV : apple_rtkit_sleep(dcp->rtk);
+	if (ret) {
+		dev_warn(dcp->dev, "RTKit did not go to sleep: %d\n", ret);
+		apple_rtkit_free_retaining_buffers(dcp->rtk);
+	} else {
+		apple_rtkit_free(dcp->rtk);
+	}
 	dcp->rtk = NULL;
+	dcp_cpu_set_run(dcp, false);
 }
 
 /* Stop the endpoints dcp_start() started, while RTKit still runs. */
 static void dcp_endpoints_shutdown(struct apple_dcp *dcp)
 {
-	if (dcp->avep) {
-		av_service_disconnect(dcp);
-		afk_shutdown(dcp->avep);
-		dcp->avep = NULL;
-	}
+	avep_shutdown(dcp);
 
-	if (dcp->dptxep) {
+	if (dcp->dptxep)
 		afk_shutdown(dcp->dptxep);
-		dcp->dptxep = NULL;
-	}
 
-	if (dcp->ibootep) {
+	if (dcp->ibootep)
 		afk_shutdown(dcp->ibootep);
-		dcp->ibootep = NULL;
-	}
 
-	if (dcp->systemep) {
+	if (dcp->systemep)
 		afk_shutdown(dcp->systemep);
-		dcp->systemep = NULL;
-	}
 
 	if (dcp->dcpavservep) {
 		afk_shutdown(dcp->dcpavservep);
 		dpavservep_detach(dcp);
-		dcp->dcpavservep = NULL;
 	}
 
 	if (dcp->shmem)
 		iomfb_shutdown(dcp);
+}
+
+/*
+ * Drop the endpoints once RTKit no longer delivers their messages.  Only a
+ * stopped firmware has let go of the memory it was given: the internal DCP
+ * keeps running, so its allocations stay where they are.
+ */
+static void dcp_endpoints_release(struct apple_dcp *dcp)
+{
+	struct apple_dcp_afkep **eps[] = {
+		&dcp->avep, &dcp->dptxep, &dcp->ibootep, &dcp->systemep,
+		&dcp->dcpavservep,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(eps); i++) {
+		if (*eps[i] && dcp->hw.restartable)
+			afk_free(*eps[i]);
+		*eps[i] = NULL;
+	}
+
+	if (!dcp->hw.restartable)
+		return;
+
+	/* The next boot announces the DPTX ports again. */
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		memset(dcp->dptxport, 0, sizeof(dcp->dptxport));
+	for (i = 0; i < ARRAY_SIZE(dcp->dptxport); i++) {
+		init_completion(&dcp->dptxport[i].enable_completion);
+		init_completion(&dcp->dptxport[i].linkcfg_completion);
+	}
+
+	iomfb_release(dcp);
 }
 
 /* Stop everything dcp_rtkit_start() and dcp_start() brought up. */
@@ -2989,6 +3031,7 @@ static void dcp_fw_shutdown(struct apple_dcp *dcp)
 {
 	dcp_endpoints_shutdown(dcp);
 	dcp_rtkit_stop(dcp);
+	dcp_endpoints_release(dcp);
 }
 
 static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
@@ -3385,6 +3428,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 
 static const struct apple_dcp_hw_data apple_dcp_hw_dcpext = {
 	.num_dptx_ports = 2,
+	.restartable = true,
 };
 
 static const struct of_device_id of_match[] = {

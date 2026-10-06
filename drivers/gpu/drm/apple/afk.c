@@ -91,13 +91,22 @@ out_free_afkep:
 void afk_shutdown(struct apple_dcp_afkep *afkep)
 {
 	unsigned long flags;
+	int ret, i;
 
-	afk_send(afkep, FIELD_PREP(RBEP_TYPE, RBEP_SHUTDOWN));
-	int ret;
+	/* Nothing can answer calls through a stopped endpoint. */
+	for (i = 0; i < AFK_MAX_CHANNEL; i++)
+		afk_service_disable(&afkep->services[i]);
 
-	ret = wait_for_completion_timeout(&afkep->stopped, msecs_to_jiffies(1000));
-	if (ret <= 0) {
-		dev_err(afkep->dcp->dev, "Timed out shutting down AFK endpoint %02x", afkep->endpoint);
+	/* A crashed firmware does not acknowledge the shutdown. */
+	if (!READ_ONCE(afkep->dcp->crashed)) {
+		afk_send(afkep, FIELD_PREP(RBEP_TYPE, RBEP_SHUTDOWN));
+
+		ret = wait_for_completion_timeout(&afkep->stopped,
+						  msecs_to_jiffies(1000));
+		if (ret <= 0)
+			dev_err(afkep->dcp->dev,
+				"Timed out shutting down AFK endpoint %02x",
+				afkep->endpoint);
 	}
 
 	spin_lock_irqsave(&afkep->lock, flags);
@@ -229,6 +238,48 @@ static void afk_remove_service_debugfs(struct apple_epic_service *srv)
 {
 }
 #endif
+
+/*
+ * Free an endpoint stopped by afk_shutdown() once the RTKit no longer
+ * delivers messages for it.  The firmware will never acknowledge the
+ * commands that timed out, so their buffers are released here.  An
+ * endpoint whose services are still pinned is leaked rather than freed.
+ */
+void afk_free(struct apple_dcp_afkep *ep)
+{
+	struct device *dev = ep->dcp->dev;
+	unsigned int i, idx;
+
+	/* Removing the debugfs files waits for the calls they made. */
+	for (i = 0; i < AFK_MAX_CHANNEL; i++)
+		afk_remove_service_debugfs(&ep->services[i]);
+
+	for (i = 0; i < AFK_MAX_CHANNEL; i++) {
+		if (WARN_ON(READ_ONCE(ep->services[i].users)))
+			return;
+	}
+
+	for (i = 0; i < AFK_MAX_CHANNEL; i++) {
+		struct apple_epic_service *service = &ep->services[i];
+
+		for_each_set_bit(idx, service->cmd_map, MAX_PENDING_CMDS) {
+			struct epic_cmd_info *cmd = &service->cmds[idx];
+
+			if (cmd->rxbuf && cmd->rxlen)
+				dma_free_coherent(dev, cmd->rxlen, cmd->rxbuf,
+						  cmd->rxbuf_dma);
+			if (cmd->txbuf && cmd->txlen)
+				dma_free_coherent(dev, cmd->txlen, cmd->txbuf,
+						  cmd->txbuf_dma);
+		}
+		if (service->debugfs.scratch)
+			devm_kfree(dev, service->debugfs.scratch);
+	}
+
+	if (ep->bfr)
+		dmam_free_coherent(dev, ep->bfr_size, ep->bfr, ep->bfr_dma);
+	devm_kfree(dev, ep);
+}
 
 static const struct apple_epic_service_ops *
 afk_match_service(struct apple_dcp_afkep *ep, const char *name)

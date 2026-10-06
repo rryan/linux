@@ -659,13 +659,14 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
 
 int iomfb_start_rtkit(struct apple_dcp *dcp)
 {
-	dma_addr_t shmem_iova;
 	apple_rtkit_start_ep(dcp->rtk, IOMFB_ENDPOINT);
 
-	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE, &shmem_iova,
-					GFP_KERNEL);
+	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE,
+					&dcp->shmem_iova, GFP_KERNEL);
+	if (!dcp->shmem)
+		return -ENOMEM;
 
-	dcp_send_message(dcp, IOMFB_ENDPOINT, dcpep_set_shmem(shmem_iova));
+	dcp_send_message(dcp, IOMFB_ENDPOINT, dcpep_set_shmem(dcp->shmem_iova));
 
 	return 0;
 }
@@ -675,6 +676,8 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 	/* We're going down */
 	dcp->active = false;
 	dcp_mode_invalidate(&dcp->mode_state);
+	if (dcp->crashed)
+		return;
 
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
@@ -687,4 +690,76 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
 	}
+}
+
+void dcp_memdesc_release(struct apple_dcp *dcp, unsigned int id)
+{
+	struct dcp_mem_descriptor *memdesc = &dcp->memdesc[id];
+	size_t size = ALIGN(memdesc->size, SZ_16K);
+
+	if (memdesc->piodma_mapped)
+		iommu_unmap(dcp->iommu_dom, memdesc->dva, size);
+	if (memdesc->buf) {
+		sg_free_table(&memdesc->map);
+		dma_free_coherent(dcp->dev, size, memdesc->buf, memdesc->dva);
+	} else if (memdesc->dva) {
+		dma_unmap_resource(dcp->dev, memdesc->dva, memdesc->size,
+				   DMA_BIDIRECTIONAL, 0);
+	}
+	memset(memdesc, 0, sizeof(*memdesc));
+	clear_bit(id, dcp->memdesc_map);
+}
+
+/*
+ * Release everything the firmware allocated or mapped through IOMFB, and
+ * forget its per-boot state.  Only valid once the firmware has stopped: it
+ * can no longer release anything itself, and the next boot starts afresh.
+ */
+void iomfb_release(struct apple_dcp *dcp)
+{
+	struct dcp_fb_reference *entry, *tmp;
+	unsigned int i;
+
+	/* mem_desc IDs start at 1, see dcp_comp_bind() */
+	i = 1;
+	for_each_set_bit_from(i, dcp->memdesc_map, DCP_MAX_MAPPINGS)
+		dcp_memdesc_release(dcp, i);
+
+	for (i = 0; i < ARRAY_SIZE(dcp->disp_reg_dva); i++) {
+		if (!dcp->disp_reg_dva[i])
+			continue;
+		dma_unmap_resource(dcp->dev, dcp->disp_reg_dva[i],
+				   resource_size(dcp->disp_registers[i]),
+				   DMA_BIDIRECTIONAL, 0);
+		dcp->disp_reg_dva[i] = 0;
+	}
+
+	if (dcp->shmem) {
+		dma_free_coherent(dcp->dev, DCP_SHMEM_SIZE, dcp->shmem,
+				  dcp->shmem_iova);
+		dcp->shmem = NULL;
+	}
+
+	memset(&dcp->ch_cmd, 0, sizeof(dcp->ch_cmd));
+	memset(&dcp->ch_oobcmd, 0, sizeof(dcp->ch_oobcmd));
+	memset(&dcp->ch_cb, 0, sizeof(dcp->ch_cb));
+	memset(&dcp->ch_oobcb, 0, sizeof(dcp->ch_oobcb));
+	memset(&dcp->ch_async, 0, sizeof(dcp->ch_async));
+	memset(&dcp->ch_oobasync, 0, sizeof(dcp->ch_oobasync));
+
+	kfree(dcp->chunks.data);
+	dcp->chunks.data = NULL;
+	dcp->chunks.length = 0;
+
+	/* Nothing scans these out any more. */
+	list_for_each_entry_safe(entry, tmp, &dcp->swapped_out_fbs, head) {
+		if (entry->fb)
+			drm_framebuffer_put(entry->fb);
+		list_del(&entry->head);
+		kfree(entry);
+	}
+
+	dcp->surfaces_cleared = false;
+	/* The display is reported again, if at all, by the next boot. */
+	WRITE_ONCE(dcp->nr_modes, 0);
 }

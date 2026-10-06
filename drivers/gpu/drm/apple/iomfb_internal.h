@@ -109,6 +109,9 @@ int dcp_parse_tag(char tag[4]);
 
 void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context);
 
+/* Undo a firmware buffer allocation or mapping, and free its descriptor. */
+void dcp_memdesc_release(struct apple_dcp *dcp, unsigned int id);
+
 /* The user may own drm_display_mode, so we need to search for our copy */
 struct dcp_display_mode *lookup_mode(struct apple_dcp *dcp,
 					    const struct drm_display_mode *mode);

@@ -90,6 +90,8 @@ struct dcp_mem_descriptor {
 	dma_addr_t dva;
 	struct sg_table map;
 	u64 reg;
+	/* also mapped into the PIODMA IOMMU domain at dva */
+	bool piodma_mapped;
 };
 
 /* Limit on call stack depth (arbitrary). Some nesting is required */
@@ -140,6 +142,11 @@ struct dcp_panel {
 
 struct apple_dcp_hw_data {
 	u32 num_dptx_ports;
+	/*
+	 * The firmware is stopped when unused and booted again from reset,
+	 * as m1n1 hands external DCPs over.
+	 */
+	bool restartable;
 };
 
 /* TODO: move IOMFB members to its own struct */
@@ -174,10 +181,13 @@ struct apple_dcp {
 
 	/* DCP shared memory */
 	void *shmem;
+	dma_addr_t shmem_iova;
 
 	/* Display registers mappable to the DCP */
 	struct resource *disp_registers[MAX_DISP_REGISTERS];
 	unsigned int nr_disp_registers;
+	/* DCP mappings of disp_registers, made on the firmware's request */
+	dma_addr_t disp_reg_dva[MAX_DISP_REGISTERS];
 
 	struct resource disp_bw_scratch_res;
 	struct resource disp_bw_doorbell_res;

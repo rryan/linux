@@ -376,7 +376,8 @@ static void av_work_service_start(struct work_struct *work)
 	av_service_connect(dcp);
 }
 
-int avep_init(struct apple_dcp *dcp)
+/* One-time setup for the lifetime of the device; the endpoint is per boot. */
+static int avep_setup(struct apple_dcp *dcp)
 {
 	struct audiosrv_data *audiosrv_data;
 	struct platform_device *audio_pdev;
@@ -426,9 +427,55 @@ int avep_init(struct apple_dcp *dcp)
 	device_link_add(&audio_pdev->dev, dev,
 			DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
 
+	return 0;
+}
+
+int avep_init(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (!dcp->audiosrv) {
+		ret = avep_setup(dcp);
+		if (ret)
+			return ret;
+	}
+	if (!dcp->audiosrv->audio_dev)
+		return 0;
+
 	dcp->avep = afk_init(dcp, AV_ENDPOINT, avep_ops);
-	if (IS_ERR(dcp->avep))
-		return PTR_ERR(dcp->avep);
+	if (IS_ERR(dcp->avep)) {
+		ret = PTR_ERR(dcp->avep);
+		dcp->avep = NULL;
+		return ret;
+	}
 	dcp->avep->debugfs_entry = dcp->ep_debugfs[AV_ENDPOINT - 0x20];
 	return afk_start(dcp->avep);
+}
+
+/*
+ * Stop the AV endpoint.  The firmware does not tear its services down on the
+ * way out, so drop the audio service here: audio calls fail until the next
+ * boot announces it again.
+ */
+void avep_shutdown(struct apple_dcp *dcp)
+{
+	struct audiosrv_data *asrv = dcp->audiosrv;
+
+	if (!dcp->avep)
+		return;
+
+	if (!dcp->crashed)
+		av_service_disconnect(dcp);
+	afk_shutdown(dcp->avep);
+	cancel_work_sync(&asrv->start_av_service_wq);
+
+	mutex_lock(&asrv->plug_lock);
+	down_write(&asrv->srv_rwsem);
+	asrv->srv = NULL;
+	up_write(&asrv->srv_rwsem);
+	asrv->plugged = false;
+	asrv->is_open = false;
+	if (asrv->audio_dev)
+		dcpaud_disconnect(asrv->audio_dev);
+	mutex_unlock(&asrv->plug_lock);
 }
