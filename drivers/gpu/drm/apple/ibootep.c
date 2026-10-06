@@ -23,6 +23,12 @@ static const struct apple_epic_service_ops ibootep_ops[] = {
 int ibootep_init(struct apple_dcp *dcp)
 {
 	dcp->ibootep = afk_init(dcp, DISP0_ENDPOINT, ibootep_ops);
+	if (IS_ERR(dcp->ibootep)) {
+		int ret = PTR_ERR(dcp->ibootep);
+
+		dcp->ibootep = NULL;
+		return ret;
+	}
 	afk_start(dcp->ibootep);
 
 	return 0;

@@ -2344,8 +2344,6 @@ int dcp_start(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
-	init_completion(&dcp->start_done);
-
 	/* start RTKit endpoints */
 	ret = systemep_init(dcp);
 	if (ret)
@@ -2448,29 +2446,28 @@ static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 	return 0;
 }
 
+/* Wait for the firmware endpoints dcp_start() started to come up. */
+static int dcp_wait_started(struct apple_dcp *dcp, unsigned long timeout)
+{
+	if (!dcp->crashed && !dcp->active && timeout)
+		wait_for_completion_timeout(&dcp->start_done, timeout);
+
+	if (dcp->crashed)
+		return -ENODEV;
+
+	return dcp->active ? 0 : -ETIMEDOUT;
+}
+
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
-	if (dcp->crashed)
-		return -ENODEV;
-	if (dcp->active)
-		return dcp_enable_dp2hdmi_hpd(dcp);
-	if (timeout <= 0)
-		return -ETIMEDOUT;
-
-	ret = wait_for_completion_timeout(&dcp->start_done, timeout);
-	if (ret < 0)
+	ret = dcp_wait_started(dcp, timeout);
+	if (ret)
 		return ret;
 
-	if (dcp->crashed)
-		return -ENODEV;
-
-	if (dcp->active)
-		dcp_enable_dp2hdmi_hpd(dcp);
-
-	return dcp->active ? 0 : -ETIMEDOUT;
+	return dcp_enable_dp2hdmi_hpd(dcp);
 }
 
 static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
@@ -2904,11 +2901,100 @@ static void dcp_enable_typec_work(struct apple_dcp *dcp)
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);
 }
 
+static void dcp_cpu_set_run(struct apple_dcp *dcp, bool run)
+{
+	u32 cpu_ctrl;
+
+	cpu_ctrl = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	if (run)
+		cpu_ctrl |= APPLE_DCP_COPROC_CPU_CONTROL_RUN;
+	else
+		cpu_ctrl &= ~APPLE_DCP_COPROC_CPU_CONTROL_RUN;
+	writel_relaxed(cpu_ctrl, dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+}
+
+/*
+ * Start the coprocessor and its RTKit firmware.  dcp_start() then starts the
+ * endpoints and dcp_wait_started() waits for them.
+ */
+static int dcp_rtkit_start(struct apple_dcp *dcp)
+{
+	int ret;
+
+	reinit_completion(&dcp->start_done);
+	dcp_cpu_set_run(dcp, true);
+
+	dcp->rtk = apple_rtkit_init(dcp->dev, dcp, "mbox", 0, &rtkit_ops);
+	if (IS_ERR(dcp->rtk)) {
+		ret = PTR_ERR(dcp->rtk);
+		dcp->rtk = NULL;
+		return dev_err_probe(dcp->dev, ret, "Failed to initialize RTKit\n");
+	}
+
+	ret = apple_rtkit_wake(dcp->rtk);
+	if (ret) {
+		dev_err(dcp->dev, "Failed to boot RTKit: %d\n", ret);
+		apple_rtkit_free(dcp->rtk);
+		dcp->rtk = NULL;
+	}
+
+	return ret;
+}
+
+static void dcp_rtkit_stop(struct apple_dcp *dcp)
+{
+	if (!dcp->rtk)
+		return;
+
+	apple_rtkit_free(dcp->rtk);
+	dcp->rtk = NULL;
+}
+
+/* Stop the endpoints dcp_start() started, while RTKit still runs. */
+static void dcp_endpoints_shutdown(struct apple_dcp *dcp)
+{
+	if (dcp->avep) {
+		av_service_disconnect(dcp);
+		afk_shutdown(dcp->avep);
+		dcp->avep = NULL;
+	}
+
+	if (dcp->dptxep) {
+		afk_shutdown(dcp->dptxep);
+		dcp->dptxep = NULL;
+	}
+
+	if (dcp->ibootep) {
+		afk_shutdown(dcp->ibootep);
+		dcp->ibootep = NULL;
+	}
+
+	if (dcp->systemep) {
+		afk_shutdown(dcp->systemep);
+		dcp->systemep = NULL;
+	}
+
+	if (dcp->dcpavservep) {
+		afk_shutdown(dcp->dcpavservep);
+		dpavservep_detach(dcp);
+		dcp->dcpavservep = NULL;
+	}
+
+	if (dcp->shmem)
+		iomfb_shutdown(dcp);
+}
+
+/* Stop everything dcp_rtkit_start() and dcp_start() brought up. */
+static void dcp_fw_shutdown(struct apple_dcp *dcp)
+{
+	dcp_endpoints_shutdown(dcp);
+	dcp_rtkit_stop(dcp);
+}
+
 static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
-	u32 cpu_ctrl;
 	int ret;
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
@@ -2989,22 +3075,12 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
 
-	cpu_ctrl =
-		readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	writel_relaxed(cpu_ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
-		       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-
-	dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
-	if (IS_ERR(dcp->rtk))
-		return dev_err_probe(dev, PTR_ERR(dcp->rtk),
-				     "Failed to initialize RTKit\n");
-
-	ret = apple_rtkit_wake(dcp->rtk);
+	ret = dcp_rtkit_start(dcp);
 	if (ret)
-		return dev_err_probe(dev, ret,
-				     "Failed to boot RTKit: %d\n", ret);
+		return ret;
+
 	dcp_enable_typec_work(dcp);
-	return ret;
+	return 0;
 }
 
 /*
@@ -3024,35 +3100,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	dcp_disable_typec_work(dcp, true);
 	typec_mux_put(dcp->typec_mux);
 
-	if (dcp->avep) {
-		av_service_disconnect(dcp);
-		afk_shutdown(dcp->avep);
-		dcp->avep = NULL;
-	}
-
-	if (dcp->dptxep) {
-		afk_shutdown(dcp->dptxep);
-		dcp->dptxep = NULL;
-	}
-
-	if (dcp->ibootep) {
-		afk_shutdown(dcp->ibootep);
-		dcp->ibootep = NULL;
-	}
-
-	if (dcp->systemep) {
-		afk_shutdown(dcp->systemep);
-		dcp->systemep = NULL;
-	}
-
-	if (dcp->dcpavservep) {
-		afk_shutdown(dcp->dcpavservep);
-		dpavservep_detach(dcp);
-		dcp->dcpavservep = NULL;
-	}
-
-	if (dcp->shmem)
-		iomfb_shutdown(dcp);
+	dcp_fw_shutdown(dcp);
 
 	if (dcp->piodma) {
 		dcp->iommu_dom = NULL;
@@ -3118,6 +3166,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	of_property_read_u32(dev->of_node, "apple,dptx-phy", &dcp->dptx_phy);
 	of_property_read_u32(dev->of_node, "apple,dptx-die", &dcp->dptx_die);
 	dcp->fixed_dptx_phy = dcp->dptx_phy;
+	init_completion(&dcp->start_done);
 	init_completion(&dcp->typec_iomfb_hpd_ready);
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
 			  dcp_typec_reconnect_work);

@@ -857,8 +857,11 @@ int dptxep_init(struct apple_dcp *dcp)
 	init_completion(&dcp->dptxport[1].linkcfg_completion);
 
 	dcp->dptxep = afk_init(dcp, DPTX_ENDPOINT, dptxep_ops);
-	if (IS_ERR(dcp->dptxep))
-		return PTR_ERR(dcp->dptxep);
+	if (IS_ERR(dcp->dptxep)) {
+		ret = PTR_ERR(dcp->dptxep);
+		dcp->dptxep = NULL;
+		return ret;
+	}
 
 	ret = afk_start(dcp->dptxep);
 	if (ret)
