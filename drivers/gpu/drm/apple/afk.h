@@ -269,6 +269,7 @@ struct apple_dcp_afkep {
 	spinlock_t lock;
 	u16 qe_seq;
 	bool stopping; /* lock: no new receive work after shutdown. */
+	bool asleep; /* lock: nothing is sent between afk_sleep() and afk_wake() */
 
 	const struct apple_epic_service_ops *ops;
 	struct apple_epic_service services[AFK_MAX_CHANNEL];
@@ -283,6 +284,8 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops);
 int afk_start(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
+void afk_sleep(struct apple_dcp_afkep *ep);
+int afk_wake(struct apple_dcp_afkep *ep);
 void afk_free(struct apple_dcp_afkep *ep);
 int afk_receive_message(struct apple_dcp_afkep *ep, u64 message);
 int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,

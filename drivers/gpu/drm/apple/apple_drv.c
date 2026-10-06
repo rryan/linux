@@ -631,7 +631,7 @@ static int apple_drm_init_dcp(struct device *dev)
 	/*
 	 * Starting DPTX might take some time.
 	 */
-	timeout = get_jiffies_64() + msecs_to_jiffies(3000);
+	timeout = get_jiffies_64() + DCP_START_TIMEOUT;
 
 	for (i = 0; i < num_dcp; ++i) {
 		u64 jiffies = get_jiffies_64();

@@ -28,6 +28,7 @@
 struct apple_dcp;
 struct apple_dcp_afkep;
 struct apple_dcp_typec_port;
+struct reset_control;
 
 struct apple_dcp_typec_route {
 	struct apple_dcp *dcp;
@@ -165,9 +166,23 @@ struct apple_dcp {
 
 	/* Coprocessor control register */
 	void __iomem *coproc_reg;
+	/* Coprocessor power state reset, pulsed after its CPU stopped */
+	struct reset_control *cpu_reset;
 
 	/* DCP has crashed */
 	bool crashed;
+	/*
+	 * Runtime suspended with the firmware asleep and its host state kept,
+	 * see dcp_fw_sleep().
+	 */
+	bool fw_asleep;
+
+	/* Runtime PM reference held from bind until dcp_wait_ready() */
+	bool pm_bringup;
+	/* The CRTC is powered on (dcp_poweron() .. dcp_poweroff()) */
+	bool crtc_active;
+	/* Runtime PM supplier link to the PIODMA DART */
+	struct device_link *piodma_dart_link;
 
 	DECLARE_BITMAP(iomfb_surfaces, DCP_MAX_PLANES);
 
@@ -240,6 +255,12 @@ struct apple_dcp {
 
 	/* Is the DCP booted? */
 	bool active;
+	/*
+	 * Waking up: the firmware's answer to iomfb_wake() is outstanding.
+	 * iomfb_restart records an IOMFB_MESSAGE_TYPE_INITIALIZED meanwhile.
+	 */
+	bool iomfb_relinking;
+	bool iomfb_restart;
 
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;

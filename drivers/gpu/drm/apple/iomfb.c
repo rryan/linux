@@ -649,12 +649,19 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
 {
 	enum dcpep_type type = FIELD_GET(IOMFB_MESSAGE_TYPE, message);
 
-	if (type == IOMFB_MESSAGE_TYPE_INITIALIZED)
+	if (type == IOMFB_MESSAGE_TYPE_INITIALIZED) {
+		/* Not while iomfb_wake()'s call is outstanding, see relinked(). */
+		if (READ_ONCE(dcp->iomfb_relinking)) {
+			dev_warn(dcp->dev, "IOMFB initialized again after wake\n");
+			dcp->iomfb_restart = true;
+			return;
+		}
 		iomfb_start(dcp);
-	else if (type == IOMFB_MESSAGE_TYPE_MSG)
+	} else if (type == IOMFB_MESSAGE_TYPE_MSG) {
 		dcpep_got_msg(dcp, message);
-	else
+	} else {
 		dev_warn(dcp->dev, "Ignoring unknown message %llx\n", message);
+	}
 }
 
 int iomfb_start_rtkit(struct apple_dcp *dcp)
@@ -667,6 +674,56 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 		return -ENOMEM;
 
 	dcp_send_message(dcp, IOMFB_ENDPOINT, dcpep_set_shmem(dcp->shmem_iova));
+
+	return 0;
+}
+
+/* Does the firmware or the host still owe an answer on a call channel? */
+bool iomfb_busy(struct apple_dcp *dcp)
+{
+	return dcp_channel_busy(&dcp->ch_cmd) ||
+	       dcp_channel_busy(&dcp->ch_oobcmd) ||
+	       dcp_channel_busy(&dcp->ch_cb) ||
+	       dcp_channel_busy(&dcp->ch_oobcb);
+}
+
+/*
+ * Link IOMFB again once the firmware woke up from the sleep it went to with
+ * the shared memory, channels and memory descriptors in place.  The firmware
+ * keeps the link across sleep: sending SET_SHMEM again makes ap_link add its
+ * heap pool a second time and crash ("RTK_heap_add_pool returned
+ * 0x80000001", t6021 13.5 firmware), and IOMFB_MESSAGE_TYPE_INITIALIZED
+ * only follows the first link after a boot.  Start the endpoint and ask
+ * IOMFB something instead; its answer completes start_done.
+ */
+int iomfb_wake(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (iomfb_busy(dcp)) {
+		dev_err(dcp->dev, "wake: an IOMFB call is still outstanding\n");
+		return -EBUSY;
+	}
+
+	ret = apple_rtkit_start_ep(dcp->rtk, IOMFB_ENDPOINT);
+	if (ret)
+		return ret;
+
+	WRITE_ONCE(dcp->iomfb_relinking, true);
+	dcp->iomfb_restart = false;
+	dev_dbg(dcp->dev, "wake: IOMFB endpoint started\n");
+
+	switch (dcp->fw_compat) {
+	case DCP_FIRMWARE_V_12_3:
+		iomfb_relink_v12_3(dcp);
+		break;
+	case DCP_FIRMWARE_V_13_5:
+		iomfb_relink_v13_3(dcp);
+		break;
+	default:
+		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
+		return -EINVAL;
+	}
 
 	return 0;
 }

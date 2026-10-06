@@ -91,14 +91,19 @@ out_free_afkep:
 void afk_shutdown(struct apple_dcp_afkep *afkep)
 {
 	unsigned long flags;
+	bool asleep;
 	int ret, i;
 
 	/* Nothing can answer calls through a stopped endpoint. */
 	for (i = 0; i < AFK_MAX_CHANNEL; i++)
 		afk_service_disable(&afkep->services[i]);
 
-	/* A crashed firmware does not acknowledge the shutdown. */
-	if (!READ_ONCE(afkep->dcp->crashed)) {
+	spin_lock_irqsave(&afkep->lock, flags);
+	asleep = afkep->asleep;
+	spin_unlock_irqrestore(&afkep->lock, flags);
+
+	/* A crashed or sleeping firmware does not acknowledge the shutdown. */
+	if (!asleep && !READ_ONCE(afkep->dcp->crashed)) {
 		afk_send(afkep, FIELD_PREP(RBEP_TYPE, RBEP_SHUTDOWN));
 
 		ret = wait_for_completion_timeout(&afkep->stopped,
@@ -132,6 +137,42 @@ int afk_start(struct apple_dcp_afkep *ep)
 		return -ETIMEDOUT;
 	else
 		return 0;
+}
+
+/*
+ * The co-processor goes to sleep with the endpoint's session in place: the
+ * firmware keeps its rings and services in DRAM, and so does the host.  Send
+ * nothing until afk_wake(), and handle what the firmware sent before.
+ */
+void afk_sleep(struct apple_dcp_afkep *ep)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ep->lock, flags);
+	ep->asleep = true;
+	spin_unlock_irqrestore(&ep->lock, flags);
+
+	flush_workqueue(ep->wq);
+}
+
+/*
+ * Resume the session afk_sleep() kept once the co-processor woke up: RTKit
+ * starts the endpoint again, the rings carry on where they were.
+ */
+int afk_wake(struct apple_dcp_afkep *ep)
+{
+	unsigned long flags;
+	int ret;
+
+	ret = apple_rtkit_start_ep(ep->dcp->rtk, ep->endpoint);
+	if (ret)
+		return ret;
+
+	spin_lock_irqsave(&ep->lock, flags);
+	ep->asleep = false;
+	spin_unlock_irqrestore(&ep->lock, flags);
+
+	return 0;
 }
 
 static void afk_getbuf(struct apple_dcp_afkep *ep, u64 message)
@@ -846,7 +887,7 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	int ret;
 
 	spin_lock_irqsave(&ep->lock, flags);
-	if (ep->stopping) {
+	if (ep->stopping || ep->asleep) {
 		ret = -ESHUTDOWN;
 		goto out;
 	}

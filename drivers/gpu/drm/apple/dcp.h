@@ -53,6 +53,9 @@ bool dcp_fw_compat_is_12_x(struct platform_device *pdev);
 unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev);
 void dcp_link(struct platform_device *pdev, struct apple_crtc *apple,
 	      struct apple_connector *connector);
+/* Time dcp_start() is given until the firmware is up, DPTX included. */
+#define DCP_START_TIMEOUT msecs_to_jiffies(3000)
+
 int dcp_start(struct platform_device *pdev);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state);
@@ -83,6 +86,8 @@ int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, bool active);
 
 int iomfb_start_rtkit(struct apple_dcp *dcp);
 void iomfb_shutdown(struct apple_dcp *dcp);
+bool iomfb_busy(struct apple_dcp *dcp);
+int iomfb_wake(struct apple_dcp *dcp);
 void iomfb_release(struct apple_dcp *dcp);
 /* rtkit message handler for IOMFB messages */
 void iomfb_recv_msg(struct apple_dcp *dcp, u64 message);

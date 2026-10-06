@@ -21,6 +21,8 @@
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
+#include <linux/pm_runtime.h>
+#include <linux/reset.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
@@ -47,8 +49,6 @@
 
 #define APPLE_DCP_COPROC_CPU_CONTROL	 0x44
 #define APPLE_DCP_COPROC_CPU_CONTROL_RUN BIT(4)
-
-#define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
 static bool show_notch;
 module_param(show_notch, bool, 0644);
@@ -1919,6 +1919,10 @@ static struct apple_rtkit_ops rtkit_ops = {
 
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 {
+	/* Stopped firmware: the caller must hold a runtime PM reference. */
+	if (WARN_ON_ONCE(!dcp->rtk))
+		return;
+
 	trace_dcp_send_msg(dcp, endpoint, message);
 	apple_rtkit_send_message(dcp->rtk, endpoint, message, NULL,
 				 true);
@@ -2458,16 +2462,28 @@ static int dcp_wait_started(struct apple_dcp *dcp, unsigned long timeout)
 	return dcp->active ? 0 : -ETIMEDOUT;
 }
 
+/* Bring-up is over: let runtime PM stop the firmware once unused. */
+static void dcp_runtime_pm_bringup_done(struct apple_dcp *dcp)
+{
+	if (!dcp->pm_bringup)
+		return;
+
+	dcp->pm_bringup = false;
+	pm_runtime_put_autosuspend(dcp->dev);
+}
+
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
 	ret = dcp_wait_started(dcp, timeout);
-	if (ret)
-		return ret;
+	if (!ret)
+		ret = dcp_enable_dp2hdmi_hpd(dcp);
 
-	return dcp_enable_dp2hdmi_hpd(dcp);
+	dcp_runtime_pm_bringup_done(dcp);
+
+	return ret;
 }
 
 static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
@@ -2491,6 +2507,8 @@ void dcp_poweron(struct platform_device *pdev)
 	bool wait_for_typec_hpd = false;
 	unsigned long remaining;
 	int ret;
+
+	WRITE_ONCE(dcp->crtc_active, true);
 
 	if (dcp_is_typec_output(dcp)) {
 		wait_for_typec_hpd = READ_ONCE(dcp->typec_crtc_off) &&
@@ -2585,6 +2603,8 @@ void dcp_poweroff(struct platform_device *pdev)
 			dcp_dptx_disconnect(dcp, 0);
 		}
 	}
+
+	WRITE_ONCE(dcp->crtc_active, false);
 }
 
 static void dcp_work_register_backlight(struct work_struct *work)
@@ -2618,6 +2638,48 @@ static void dcp_work_update_backlight(struct work_struct *work)
 	dcp_backlight_update(dcp);
 }
 
+/*
+ * The IOMMU core makes piodma a runtime PM consumer of its DART and keeps the
+ * DART active (DL_FLAG_RPM_ACTIVE) until piodma runtime suspends.  piodma
+ * never binds a driver, so that never happens, and the DART would keep the
+ * power domain it shares with an external DCP on for good.  It is the DCP's
+ * display engine that uses this DART: make the DART a runtime PM supplier of
+ * the DCP instead, and release piodma's hold on it.
+ */
+static int dcp_link_piodma_dart(struct apple_dcp *dcp, struct device_node *node)
+{
+	struct of_phandle_args args;
+	struct platform_device *dart;
+	int ret;
+
+	ret = of_parse_phandle_with_args(node, "iommus", "#iommu-cells", 0,
+					 &args);
+	if (ret)
+		return ret;
+
+	dart = of_find_device_by_node(args.np);
+	of_node_put(args.np);
+	if (!dart)
+		return -ENODEV;
+
+	dcp->piodma_dart_link = device_link_add(dcp->dev, &dart->dev,
+						DL_FLAG_STATELESS |
+						DL_FLAG_PM_RUNTIME |
+						DL_FLAG_RPM_ACTIVE);
+	put_device(&dart->dev);
+	if (!dcp->piodma_dart_link)
+		return -EINVAL;
+
+	/* Already the status of a driverless device; drops the link references. */
+	ret = pm_runtime_set_suspended(&dcp->piodma->dev);
+	if (ret) {
+		device_link_del(dcp->piodma_dart_link);
+		dcp->piodma_dart_link = NULL;
+	}
+
+	return ret;
+}
+
 static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 {
 	int ret;
@@ -2649,6 +2711,14 @@ static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 				    "piodma device\n");
 		dcp->iommu_dom = NULL;
 		goto err_destroy_pdev;
+	}
+
+	if (dcp->hw.restartable) {
+		ret = dcp_link_piodma_dart(dcp, node);
+		if (ret) {
+			dev_err(dcp->dev, "Failed to link PIODMA DART: %d\n", ret);
+			goto err_destroy_pdev;
+		}
 	}
 
 	return 0;
@@ -2928,7 +2998,8 @@ static int dcp_rtkit_start(struct apple_dcp *dcp)
 	if (IS_ERR(dcp->rtk)) {
 		ret = PTR_ERR(dcp->rtk);
 		dcp->rtk = NULL;
-		return dev_err_probe(dcp->dev, ret, "Failed to initialize RTKit\n");
+		dev_err_probe(dcp->dev, ret, "Failed to initialize RTKit\n");
+		goto err_stop_cpu;
 	}
 
 	ret = apple_rtkit_wake(dcp->rtk);
@@ -2936,9 +3007,45 @@ static int dcp_rtkit_start(struct apple_dcp *dcp)
 		dev_err(dcp->dev, "Failed to boot RTKit: %d\n", ret);
 		apple_rtkit_free(dcp->rtk);
 		dcp->rtk = NULL;
+		goto err_stop_cpu;
 	}
 
+	return 0;
+
+err_stop_cpu:
+	if (dcp->hw.restartable)
+		dcp_cpu_set_run(dcp, false);
 	return ret;
+}
+
+/*
+ * Stop the CPU of a restartable DCP whose RTKit went to sleep, as m1n1 does
+ * before it hands an external DCP over: rtkit_sleep() stops the CPU
+ * (asc_cpu_stop()), then dcp_shutdown() resets its power state
+ * (pmgr_reset()).  Resetting the CPU before its first boot instead breaks
+ * that boot: the firmware does not answer RTKit (seen on t6021 dcpext2).
+ *
+ * The reset does not lose what dcp_fw_sleep() keeps.  The firmware saved
+ * its state in DRAM when it acknowledged SLEEP and restores it when the
+ * CPU starts again from its reset vector: on t6021, after SLEEP, this
+ * reset and a power cycle of the dispext domains, RTKit answered INIT with
+ * HELLO and the firmware's AFK interfaces came back with their state (the
+ * same interfaces, channel numbers continuing).  With the reset the CPU
+ * always takes that path, whether or not genpd turned the CPU's domain
+ * off, instead of resuming wherever SLEEP left it when the domain stayed
+ * on.
+ */
+static void dcp_cpu_stop(struct apple_dcp *dcp)
+{
+	int ret;
+
+	dcp_cpu_set_run(dcp, false);
+	if (!dcp->cpu_reset)
+		return;
+
+	ret = reset_control_reset(dcp->cpu_reset);
+	if (ret)
+		dev_warn(dcp->dev, "Failed to reset the coprocessor: %d\n", ret);
 }
 
 static void dcp_rtkit_stop(struct apple_dcp *dcp)
@@ -2955,10 +3062,14 @@ static void dcp_rtkit_stop(struct apple_dcp *dcp)
 		return;
 	}
 
-	/*
-	 * Put the firmware to sleep and stop the CPU, as m1n1 does before it
-	 * hands an external DCP over (dcp_shutdown(), rtkit_sleep()).
-	 */
+	/* Already asleep and stopped by dcp_fw_sleep(). */
+	if (dcp->fw_asleep) {
+		apple_rtkit_free(dcp->rtk);
+		dcp->rtk = NULL;
+		dcp->fw_asleep = false;
+		return;
+	}
+
 	ret = dcp->crashed ? -ENODEV : apple_rtkit_sleep(dcp->rtk);
 	if (ret) {
 		dev_warn(dcp->dev, "RTKit did not go to sleep: %d\n", ret);
@@ -2967,10 +3078,13 @@ static void dcp_rtkit_stop(struct apple_dcp *dcp)
 		apple_rtkit_free(dcp->rtk);
 	}
 	dcp->rtk = NULL;
-	dcp_cpu_set_run(dcp, false);
+	dcp_cpu_stop(dcp);
 }
 
-/* Stop the endpoints dcp_start() started, while RTKit still runs. */
+/*
+ * Stop the endpoints dcp_start() started.  A crashed or sleeping firmware is
+ * not asked to take part.
+ */
 static void dcp_endpoints_shutdown(struct apple_dcp *dcp)
 {
 	avep_shutdown(dcp);
@@ -2989,7 +3103,8 @@ static void dcp_endpoints_shutdown(struct apple_dcp *dcp)
 		dpavservep_detach(dcp);
 	}
 
-	if (dcp->shmem)
+	/* dcp_fw_sleep() powered IOMFB down already. */
+	if (dcp->shmem && !dcp->fw_asleep)
 		iomfb_shutdown(dcp);
 }
 
@@ -3032,6 +3147,228 @@ static void dcp_fw_shutdown(struct apple_dcp *dcp)
 	dcp_endpoints_shutdown(dcp);
 	dcp_rtkit_stop(dcp);
 	dcp_endpoints_release(dcp);
+}
+
+#define DCP_NR_AFK_EPS 5
+
+/* The AFK endpoints dcp_start() started, in the order it starts them. */
+static void dcp_afk_endpoints(struct apple_dcp *dcp,
+			      struct apple_dcp_afkep *eps[DCP_NR_AFK_EPS])
+{
+	eps[0] = dcp->systemep;
+	eps[1] = dcp->dcpavservep;
+	eps[2] = dcp->ibootep;
+	eps[3] = dcp->dptxep;
+	eps[4] = dcp->avep;
+}
+
+/*
+ * Put the firmware of an idle restartable DCP to sleep for runtime PM, with
+ * the host side of every session it has kept as it is while running: RTKit
+ * and its buffers, the AFK endpoints with their rings and services, IOMFB's
+ * shared memory, call channels, memory descriptors and mappings.  The
+ * firmware keeps its side in DRAM across SLEEP, and macOS keeps the AFK
+ * services of an idle external DCP registered, without terminating them.
+ */
+static int dcp_fw_sleep(struct apple_dcp *dcp)
+{
+	struct apple_dcp_afkep *eps[DCP_NR_AFK_EPS];
+	unsigned int i;
+	int ret;
+
+	/* Without its shared memory IOMFB never came up: nothing to keep. */
+	if (!dcp->shmem)
+		return -ENODEV;
+
+	/* Let go of the display a DPTX port holds after an HDMI unplug. */
+	for (i = 0; i < ARRAY_SIZE(dcp->dptxport); i++) {
+		if (READ_ONCE(dcp->dptxport[i].connected))
+			dcp_dptx_disconnect(dcp, i);
+	}
+	if (dcp->avep)
+		av_service_disconnect(dcp);
+
+	iomfb_shutdown(dcp);
+	if (iomfb_busy(dcp)) {
+		dev_err(dcp->dev, "sleep: IOMFB did not power down\n");
+		return -ETIMEDOUT;
+	}
+	dev_dbg(dcp->dev, "sleep: IOMFB powered down\n");
+
+	dcp_afk_endpoints(dcp, eps);
+	for (i = 0; i < ARRAY_SIZE(eps); i++) {
+		if (eps[i])
+			afk_sleep(eps[i]);
+	}
+
+	ret = apple_rtkit_sleep(dcp->rtk);
+	if (ret) {
+		dev_err(dcp->dev, "sleep: RTKit did not go to sleep: %d\n", ret);
+		return ret;
+	}
+	dev_dbg(dcp->dev, "sleep: RTKit asleep, mailbox released\n");
+
+	dcp_cpu_stop(dcp);
+	dcp->fw_asleep = true;
+
+	return 0;
+}
+
+/*
+ * Wake the firmware dcp_fw_sleep() put to sleep and resume its sessions:
+ * RTKit runs its boot handshake again, the application endpoints are started
+ * again, and IOMFB answering a call tells that the firmware is back.
+ */
+static int dcp_fw_wake(struct apple_dcp *dcp)
+{
+	struct apple_dcp_afkep *eps[DCP_NR_AFK_EPS];
+	unsigned int i;
+	int ret;
+
+	/* Stopped for good after a failure, see dcp_runtime_suspend(). */
+	if (!dcp->fw_asleep) {
+		dev_err(dcp->dev, "wake: the firmware was stopped after a failure\n");
+		return -ENODEV;
+	}
+
+	reinit_completion(&dcp->start_done);
+	dcp_cpu_set_run(dcp, true);
+	dev_dbg(dcp->dev, "wake: CPU running\n");
+
+	ret = apple_rtkit_wake(dcp->rtk);
+	if (ret) {
+		dev_err(dcp->dev, "wake: RTKit did not wake up: %d\n", ret);
+		goto err;
+	}
+	dev_dbg(dcp->dev, "wake: RTKit running\n");
+
+	dcp_afk_endpoints(dcp, eps);
+	for (i = 0; i < ARRAY_SIZE(eps); i++) {
+		if (!eps[i])
+			continue;
+
+		ret = afk_wake(eps[i]);
+		if (ret) {
+			dev_err(dcp->dev, "wake: AFK endpoint %02x did not start: %d\n",
+				eps[i]->endpoint, ret);
+			goto err;
+		}
+		dev_dbg(dcp->dev, "wake: AFK endpoint %02x started\n",
+			eps[i]->endpoint);
+	}
+
+	ret = iomfb_wake(dcp);
+	if (!ret)
+		ret = dcp_wait_started(dcp, DCP_START_TIMEOUT);
+	if (ret) {
+		dev_err(dcp->dev, "wake: IOMFB did not answer: %d\n", ret);
+		goto err;
+	}
+
+	dcp->fw_asleep = false;
+	return 0;
+
+err:
+	/* Unusable until rebound; nothing is asked of it on the way down. */
+	WRITE_ONCE(dcp->iomfb_relinking, false);
+	dcp->fw_asleep = false;
+	dcp->crashed = true;
+	dcp_fw_shutdown(dcp);
+	return ret;
+}
+
+#define DCP_AUTOSUSPEND_DELAY_MS 5000
+
+/*
+ * Runtime PM puts the firmware of a restartable DCP to sleep while no display
+ * needs it.  Bring-up keeps it running until dcp_wait_ready().
+ */
+static int dcp_runtime_pm_init(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+	int ret;
+
+	ret = pm_runtime_set_active(dev);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to set runtime PM status\n");
+
+	pm_runtime_get_noresume(dev);
+	dcp->pm_bringup = true;
+	pm_runtime_set_autosuspend_delay(dev, DCP_AUTOSUSPEND_DELAY_MS);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_enable(dev);
+
+	return 0;
+}
+
+/* Undo dcp_runtime_pm_init() once runtime PM has been disabled. */
+static void dcp_runtime_pm_release(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+
+	if (dcp->pm_bringup) {
+		dcp->pm_bringup = false;
+		pm_runtime_put_noidle(dev);
+	}
+	pm_runtime_set_suspended(dev);
+	pm_runtime_dont_use_autosuspend(dev);
+}
+
+/* Does a display still need the firmware? */
+static bool dcp_fw_in_use(struct apple_dcp *dcp)
+{
+	return READ_ONCE(dcp->active_typec_route) ||
+	       READ_ONCE(dcp->crtc_active) ||
+	       (dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd));
+}
+
+static int dcp_runtime_suspend(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	struct apple_connector *connector = dcp->connector;
+	int ret;
+
+	if (dcp_fw_in_use(dcp)) {
+		dev_dbg(dev, "display in use, firmware kept running\n");
+		return -EBUSY;
+	}
+
+	/* Work using the endpoints, only queued while a display is attached. */
+	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+
+	ret = dcp->crashed ? -ENODEV : dcp_fw_sleep(dcp);
+	if (ret) {
+		/* Stop it for good, its power domains can turn off all the same. */
+		dcp->crashed = true;
+		dcp_fw_shutdown(dcp);
+	}
+
+	/* The firmware reports no display on this output while it sleeps. */
+	if (connector && READ_ONCE(connector->connected)) {
+		WRITE_ONCE(connector->connected, false);
+		schedule_work(&connector->hotplug_wq);
+	}
+
+	dev_dbg(dev, "firmware %s\n", ret ? "stopped" : "asleep");
+	return 0;
+}
+
+static int dcp_runtime_resume(struct device *dev)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	int ret;
+
+	ret = dcp_fw_wake(dcp);
+	if (ret) {
+		dev_err(dev, "Failed to wake the firmware up, the display pipeline is unusable: %d\n",
+			ret);
+		return ret;
+	}
+
+	dev_dbg(dev, "firmware awake\n");
+	return 0;
 }
 
 static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
@@ -3122,6 +3459,14 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (ret)
 		return ret;
 
+	if (dcp->hw.restartable) {
+		ret = dcp_runtime_pm_init(dcp);
+		if (ret) {
+			dcp_fw_shutdown(dcp);
+			return ret;
+		}
+	}
+
 	dcp_enable_typec_work(dcp);
 	return 0;
 }
@@ -3140,10 +3485,23 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (dcp->hdmi_hpd_irq)
 		disable_irq(dcp->hdmi_hpd_irq);
 
+	/* No more runtime suspend or resume: the firmware state is final. */
+	if (dcp->hw.restartable)
+		pm_runtime_disable(dev);
+
 	dcp_disable_typec_work(dcp, true);
 	typec_mux_put(dcp->typec_mux);
 
+	/* Also releases what a sleeping firmware kept, without waking it. */
 	dcp_fw_shutdown(dcp);
+
+	if (dcp->hw.restartable)
+		dcp_runtime_pm_release(dcp);
+
+	if (dcp->piodma_dart_link) {
+		device_link_del(dcp->piodma_dart_link);
+		dcp->piodma_dart_link = NULL;
+	}
 
 	if (dcp->piodma) {
 		dcp->iommu_dom = NULL;
@@ -3203,6 +3561,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->dcpavserv.lock);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	if (dcp->hw.restartable) {
+		dcp->cpu_reset = devm_reset_control_get_optional_exclusive(dev, NULL);
+		if (IS_ERR(dcp->cpu_reset))
+			return dev_err_probe(dev, PTR_ERR(dcp->cpu_reset),
+					     "Failed to get coprocessor reset\n");
+	}
 	dcp->fixed_connector_type = dcp_connector_type_from_dt(dev->of_node);
 	dcp->connector_type = dcp->fixed_connector_type;
 	of_property_read_u32(dev->of_node, "apple,dcp-index", &dcp->index);
@@ -3376,7 +3740,8 @@ static int dcp_platform_suspend(struct device *dev)
 	dcp_disable_typec_work(dcp, false);
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
 
-	if (dcp->avep)
+	/* A sleeping firmware closed the audio service before (dcp_fw_sleep()). */
+	if (dcp->avep && !dcp->fw_asleep)
 		av_service_disconnect(dcp);
 
 	if (dcp->hdmi_hpd_irq) {
@@ -3404,14 +3769,16 @@ static int dcp_platform_resume(struct device *dev)
 	if (dcp->hdmi_hpd_irq)
 		enable_irq(dcp->hdmi_hpd_irq);
 
-	if (dcp->avep)
+	if (dcp->avep && !dcp->fw_asleep)
 		av_service_connect(dcp);
 
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(dcp_platform_pm_ops,
-				dcp_platform_suspend, dcp_platform_resume);
+static const struct dev_pm_ops dcp_platform_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(dcp_platform_suspend, dcp_platform_resume)
+	RUNTIME_PM_OPS(dcp_runtime_suspend, dcp_runtime_resume, NULL)
+};
 
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6020 = {
@@ -3447,7 +3814,7 @@ static struct platform_driver apple_platform_driver = {
 	.driver	= {
 		.name = "apple-dcp",
 		.of_match_table	= of_match,
-		.pm = pm_sleep_ptr(&dcp_platform_pm_ops),
+		.pm = pm_ptr(&dcp_platform_pm_ops),
 	},
 };
 

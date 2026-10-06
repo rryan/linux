@@ -1551,6 +1551,33 @@ static void dcp_started(struct apple_dcp *dcp, void *data, void *cookie)
 	iomfb_get_color_remap_mode(dcp, false, &color_remap, init_1, cookie);
 }
 
+static void relinked(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	WRITE_ONCE(dcp->iomfb_relinking, false);
+
+	/*
+	 * The firmware started IOMFB afresh: boot it as at bind.  It reports
+	 * the display again, if one is attached.
+	 */
+	if (dcp->iomfb_restart) {
+		dcp->iomfb_restart = false;
+		WRITE_ONCE(dcp->nr_modes, 0);
+		DCP_FW_NAME(iomfb_start)(dcp);
+		return;
+	}
+
+	dev_dbg(dcp->dev, "wake: IOMFB answered is_main_display: %u\n",
+		*(u32 *)out);
+	dcp->active = true;
+	complete(&dcp->start_done);
+}
+
+/* Ask IOMFB something once the firmware woke up, see iomfb_wake(). */
+void DCP_FW_NAME(iomfb_relink)(struct apple_dcp *dcp)
+{
+	dcp_is_main_display(dcp, false, relinked, NULL);
+}
+
 void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp)
 {
 	struct dcp_set_power_state_req req = {
