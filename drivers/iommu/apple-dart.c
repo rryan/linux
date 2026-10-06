@@ -919,6 +919,42 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	return dart->hw->invalidate_tlb(&stream_map);
 }
 
+/*
+ * Take a runtime PM reference on @dart when its TLB has to be invalidated now.
+ *
+ * Runtime resume resets an unlocked DART that is not behind a PCIe tunnel,
+ * which invalidates its whole TLB before the restored TTBRs enable translation
+ * again, and none of its masters runs while it is suspended. Flushing such a
+ * DART while it is suspended would only power it up to invalidate a TLB that
+ * its next resume clears anyway.
+ *
+ * Return: 1 with a reference held, 0 if the next resume invalidates the TLB,
+ * or a negative error code.
+ */
+static int apple_dart_get_for_flush(struct apple_dart *dart)
+{
+	int ret;
+
+	if (!dart->locked && !dart->tunneled) {
+		/*
+		 * The page tables are updated before the runtime PM lock is
+		 * taken here, and so before any later resume resets the DART.
+		 */
+		ret = pm_runtime_get_if_active(dart->dev);
+		if (ret > 0)
+			return 1;
+		/*
+		 * A suspend in progress may still fail and leave the DART
+		 * active, and a resume in progress may have reset it already.
+		 */
+		if (pm_runtime_status_suspended(dart->dev))
+			return 0;
+	}
+
+	ret = pm_runtime_resume_and_get(dart->dev);
+	return ret < 0 ? ret : 1;
+}
+
 static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 					   bool range, u64 first, u64 last)
 {
@@ -933,12 +969,14 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 			stream.sidmap[j] = atomic_long_read(&map->sidmap[j]);
 		if (bitmap_empty(stream.sidmap, stream.dart->num_streams))
 			continue;
-		ret = pm_runtime_resume_and_get(stream.dart->dev);
+		ret = apple_dart_get_for_flush(stream.dart);
 		if (ret < 0) {
 			dev_err_ratelimited(stream.dart->dev,
 				"failed to power DART for TLB synchronization: %d\n", ret);
 			return ret;
 		}
+		if (!ret)
+			continue;
 		ret = stream.dart->locked ? apple_dart_hw_sync_locked(cfg, &stream) : 0;
 		if (ret)
 			dev_err_ratelimited(stream.dart->dev,
