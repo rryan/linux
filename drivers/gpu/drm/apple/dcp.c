@@ -3816,6 +3816,13 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 
+/* Has runtime PM put the firmware to sleep, or stopped it after a failure? */
+static bool dcp_fw_runtime_suspended(struct apple_dcp *dcp)
+{
+	return dcp->hw.restartable && pm_runtime_enabled(dcp->dev) &&
+	       pm_runtime_status_suspended(dcp->dev);
+}
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -3841,11 +3848,14 @@ static int dcp_platform_suspend(struct device *dev)
 		}
 	}
 	/*
-	 * Set the device as a wakeup device, which forces its power
-	 * domains to stay on. We need this as we do not support full
-	 * shutdown properly yet.
+	 * A running firmware is not shut down across system sleep yet: mark
+	 * the device as a wakeup path, which keeps its power domains on.  An
+	 * external DCP that runtime PM has put to sleep keeps its state in
+	 * DRAM and needs no power, and sleeps on through resume until a
+	 * display needs it again.
 	 */
-	device_set_wakeup_path(dev);
+	if (!dcp_fw_runtime_suspended(dcp))
+		device_set_wakeup_path(dev);
 
 	return 0;
 }
