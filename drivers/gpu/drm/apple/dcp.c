@@ -99,6 +99,69 @@ static LIST_HEAD(dcp_typec_ports);
 static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port);
 static void disconnected_hpd_event(struct apple_connector *connector);
 
+/*
+ * Runtime PM references on the firmware of a restartable DCP, see
+ * dcp_runtime_suspend().  -EACCES: runtime PM does not manage the device
+ * yet, or no longer, as before bind or after unbind.  The reference is
+ * counted all the same, and the firmware is the binding's business then.
+ */
+static int dcp_pm_get(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (!dcp->hw.restartable)
+		return 0;
+
+	ret = pm_runtime_get_sync(dcp->dev);
+	if (ret < 0 && ret != -EACCES) {
+		pm_runtime_put_noidle(dcp->dev);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void dcp_pm_put(struct apple_dcp *dcp)
+{
+	if (dcp->hw.restartable)
+		pm_runtime_put_autosuspend(dcp->dev);
+}
+
+/*
+ * An HDMI sink holds the firmware while it asserts HPD: the HPD GPIO sees
+ * the sink come and go, the firmware need not run for that.  Returns
+ * whether the firmware is held for a connected sink.
+ */
+static bool dcp_hdmi_hpd_hold(struct apple_dcp *dcp, bool connected)
+{
+	lockdep_assert_held(&dcp_typec_fabric_lock);
+
+	if (connected && !dcp->hdmi_pm_ref) {
+		int ret = dcp_pm_get(dcp);
+
+		if (ret)
+			dev_err(dcp->dev, "HDMI: firmware unavailable: %d\n", ret);
+		else
+			dcp->hdmi_pm_ref = true;
+	} else if (!connected && dcp->hdmi_pm_ref) {
+		dcp->hdmi_pm_ref = false;
+		dcp_pm_put(dcp);
+	}
+
+	return dcp->hdmi_pm_ref;
+}
+
+/* As after a DP exit, hand the hybrid pipeline back to a live HDMI sink. */
+static void dcp_hdmi_reclaim(struct apple_dcp *dcp)
+{
+	if (!dcp->hdmi_hpd)
+		return;
+
+	if (dcp_hdmi_hpd_hold(dcp, gpiod_get_value_cansleep(dcp->hdmi_hpd)) &&
+	    dcp->active)
+		dcp_dptx_connect(dcp, 0);
+}
+
 bool dcp_is_typec_output(struct apple_dcp *dcp)
 {
 	return dcp->active_typec_route ||
@@ -214,6 +277,11 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		route->port->secondary_connector : route->port->connector;
 	int ret;
 
+	/* The firmware must be up before the route is: hold it while routed. */
+	ret = dcp_pm_get(dcp);
+	if (ret)
+		return ret;
+
 	/*
 	 * The fixed output's HPD handler leaves disconnects to DCP, so the port
 	 * can still be marked connected to a display that is gone. Release it
@@ -224,7 +292,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	if (dcp->fixed_route_selected) {
 		ret = mux_control_deselect(dcp->xbar);
 		if (ret)
-			return ret;
+			goto err_pm_put;
 		dcp->fixed_route_selected = false;
 	}
 
@@ -259,7 +327,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 					"failed to restore fixed display route: %d\n",
 					restore_ret);
 		}
-		return ret;
+		goto err_pm_put;
 	}
 
 	dcp->phy = route->phy;
@@ -301,6 +369,10 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 
 	dev_info(dcp->dev, "allocated Type-C DPTX PHY %u\n", route->dptx_phy);
 	return 0;
+
+err_pm_put:
+	dcp_pm_put(dcp);
+	return ret;
 }
 
 static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
@@ -348,7 +420,10 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		if (sel && sel != -EOPNOTSUPP)
 			dev_warn(dcp->dev, "DP tunnel source reset failed: %d\n", sel);
 	}
-	route->selected = false;
+	if (route->selected) {
+		route->selected = false;
+		dcp_pm_put(dcp);
+	}
 	if (dcp->active_typec_route == route)
 		dcp->active_typec_route = NULL;
 
@@ -762,10 +837,7 @@ dcp_typec_rebalance_locked(struct apple_dcp_typec_port *arriving,
 		}
 		port->owner = NULL;
 
-		/* as after a DP exit, hand the hybrid back to a live HDMI */
-		if (dcp->hdmi_hpd && dcp->active &&
-		    gpiod_get_value_cansleep(dcp->hdmi_hpd))
-			dcp_dptx_connect(dcp, 0);
+		dcp_hdmi_reclaim(dcp);
 	}
 
 	list_for_each_entry(port, &dcp_typec_ports, link) {
@@ -890,9 +962,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 				return ret;
 			port->owner = NULL;
 			port->dp_release_deadline = jiffies + msecs_to_jiffies(10000);
-			if (dcp->hdmi_hpd && dcp->active &&
-			    gpiod_get_value_cansleep(dcp->hdmi_hpd))
-				dcp_dptx_connect(dcp, 0);
+			dcp_hdmi_reclaim(dcp);
 			dcp_typec_pipeline_freed();
 		} else if (was_counted && dcp_typec_keep_order()) {
 			/* a stream the plan left dark is gone: plan the rest */
@@ -1217,9 +1287,7 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 		port->hpd = !!(port->owner || port->secondary_owner);
 		/* re-apply the next Type-C mux state in full */
 		port->applied_valid = false;
-		if (dcp->hdmi_hpd && dcp->active &&
-		    gpiod_get_value_cansleep(dcp->hdmi_hpd))
-			dcp_dptx_connect(dcp, 0);
+		dcp_hdmi_reclaim(dcp);
 		dcp_typec_pipeline_freed();
 		return 0;
 	}
@@ -2286,7 +2354,8 @@ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 	}
 	connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
 
-	/* do nothing on disconnect and trust that dcp detects it itself.
+	/* do nothing on disconnect and trust that dcp detects it itself, but
+	 * let go of the firmware: see dcp_hdmi_hpd_hold().
 	 * Parallel disconnect HPDs result drm disabling the CRTC even when it
 	 * should not.
 	 * The interrupt should be changed to rising but for now the disconnect
@@ -2300,7 +2369,7 @@ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
 		dev_info(dcp->dev, "DP2HDMI HPD irq, 500ms debounce: connected:%d\n", connected);
 	}
 
-	if (connected)
+	if (dcp_hdmi_hpd_hold(dcp, connected))
 		dcp_dptx_connect(dcp, 0);
 
 	return IRQ_HANDLED;
@@ -2438,6 +2507,8 @@ static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
 		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
 
+		scoped_guard(mutex, &dcp_typec_fabric_lock)
+			connected = dcp_hdmi_hpd_hold(dcp, connected);
 		if (connected)
 			dcp_dptx_connect(dcp, 0);
 		else
@@ -2508,7 +2579,16 @@ void dcp_poweron(struct platform_device *pdev)
 	unsigned long remaining;
 	int ret;
 
-	WRITE_ONCE(dcp->crtc_active, true);
+	/* The CRTC holds the firmware until dcp_poweroff(). */
+	if (!dcp->crtc_active) {
+		ret = dcp_pm_get(dcp);
+		if (ret) {
+			dev_err(dcp->dev, "CRTC stays off, firmware unavailable: %d\n",
+				ret);
+			return;
+		}
+		WRITE_ONCE(dcp->crtc_active, true);
+	}
 
 	if (dcp_is_typec_output(dcp)) {
 		wait_for_typec_hpd = READ_ONCE(dcp->typec_crtc_off) &&
@@ -2564,6 +2644,10 @@ void dcp_poweroff(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
+	/* dcp_poweron() could not get the firmware: nothing is on. */
+	if (!dcp->crtc_active)
+		return;
+
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
 	if (dcp->avep)
 		av_service_disconnect(dcp);
@@ -2605,6 +2689,7 @@ void dcp_poweroff(struct platform_device *pdev)
 	}
 
 	WRITE_ONCE(dcp->crtc_active, false);
+	dcp_pm_put(dcp);
 }
 
 static void dcp_work_register_backlight(struct work_struct *work)
@@ -3319,7 +3404,7 @@ static bool dcp_fw_in_use(struct apple_dcp *dcp)
 {
 	return READ_ONCE(dcp->active_typec_route) ||
 	       READ_ONCE(dcp->crtc_active) ||
-	       (dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd));
+	       READ_ONCE(dcp->hdmi_pm_ref);
 }
 
 static int dcp_runtime_suspend(struct device *dev)
@@ -3488,6 +3573,10 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	/* No more runtime suspend or resume: the firmware state is final. */
 	if (dcp->hw.restartable)
 		pm_runtime_disable(dev);
+
+	/* The HPD IRQ is off: the HDMI sink can no longer let go itself. */
+	scoped_guard(mutex, &dcp_typec_fabric_lock)
+		dcp_hdmi_hpd_hold(dcp, false);
 
 	dcp_disable_typec_work(dcp, true);
 	typec_mux_put(dcp->typec_mux);

@@ -177,10 +177,16 @@ struct apple_dcp {
 	 */
 	bool fw_asleep;
 
-	/* Runtime PM reference held from bind until dcp_wait_ready() */
+	/*
+	 * Runtime PM references on the firmware: bring-up, from bind until
+	 * dcp_wait_ready(); the CRTC, while powered on (dcp_poweron() ..
+	 * dcp_poweroff()); an HDMI sink, while it asserts HPD (under
+	 * dcp_typec_fabric_lock).  Each active Type-C route or Thunderbolt DP
+	 * tunnel holds one while route->selected is set.
+	 */
 	bool pm_bringup;
-	/* The CRTC is powered on (dcp_poweron() .. dcp_poweroff()) */
 	bool crtc_active;
+	bool hdmi_pm_ref;
 	/* Runtime PM supplier link to the PIODMA DART */
 	struct device_link *piodma_dart_link;
 
