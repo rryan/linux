@@ -693,7 +693,9 @@
 
 		orientation-switch;
 		mode-switch;
-		power-domains = <&DIE_NODE(ps_atc0_usb)>;
+		power-domains = <&DIE_NODE(ps_atc0_usb)>,
+			<&DIE_NODE(ps_atc0_usb_aon)>;
+		power-domain-names = "usb", "aon";
 	};
 
 	DIE_NODE(atcphy0_xbar): mux@70304c000 {
@@ -921,7 +923,9 @@
 
 		orientation-switch;
 		mode-switch;
-		power-domains = <&DIE_NODE(ps_atc1_usb)>;
+		power-domains = <&DIE_NODE(ps_atc1_usb)>,
+			<&DIE_NODE(ps_atc1_usb_aon)>;
+		power-domain-names = "usb", "aon";
 	};
 
 	DIE_NODE(atcphy1_xbar): mux@b0304c000 {
@@ -1149,7 +1153,9 @@
 
 		orientation-switch;
 		mode-switch;
-		power-domains = <&DIE_NODE(ps_atc2_usb)>;
+		power-domains = <&DIE_NODE(ps_atc2_usb)>,
+			<&DIE_NODE(ps_atc2_usb_aon)>;
+		power-domain-names = "usb", "aon";
 	};
 
 	DIE_NODE(atcphy2_xbar): mux@f0304c000 {
@@ -1375,7 +1381,9 @@
 
 		orientation-switch;
 		mode-switch;
-		power-domains = <&DIE_NODE(ps_atc3_usb)>;
+		power-domains = <&DIE_NODE(ps_atc3_usb)>,
+			<&DIE_NODE(ps_atc3_usb_aon)>;
+		power-domain-names = "usb", "aon";
 	};
 
 	DIE_NODE(atcphy3_xbar): mux@130304c000 {
