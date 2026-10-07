@@ -50,6 +50,15 @@ allOf:
         reg-names:
           maxItems: 5
         apple,tunable-usb2phy-reg-dflt: false
+  - if:
+      required:
+        - power-domains
+      properties:
+        power-domains:
+          minItems: 2
+    then:
+      required:
+        - power-domain-names
 
 $defs:
   apple,tunable:
@@ -109,7 +118,16 @@ properties:
   orientation-switch: true
 
   power-domains:
-    maxItems: 1
+    minItems: 1
+    items:
+      - description: USB logic of the port
+      - description: Always-on (AON) part of the USB logic of the port
+
+  power-domain-names:
+    minItems: 1
+    items:
+      - const: usb
+      - const: aon
 
   ports:
     $ref: /schemas/graph.yaml#/properties/ports
