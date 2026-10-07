@@ -18,6 +18,7 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/soc/apple/dp-tunnel.h>
 
 /*
@@ -510,6 +511,52 @@ static int apple_dpxbar_set(struct mux_control *mux, int state)
 	return ret;
 }
 
+/*
+ * A connected output keeps the crossbar powered: it holds a runtime PM
+ * reference from the switch that connects it to the one that disconnects it.
+ * The mux core serialises the switches of an output, and only those change
+ * its selection.
+ */
+static int apple_dpxbar_set_pm(struct mux_control *mux, int state,
+			       int (*set)(struct mux_control *mux, int state))
+{
+	struct apple_dpxbar *dpxbar = mux_chip_priv(mux->chip);
+	unsigned int index = mux_control_get_index(mux);
+	bool was_connected, connected;
+	int ret;
+
+	if (index >= MUX_MAX)
+		return -EINVAL;
+
+	ret = pm_runtime_resume_and_get(dpxbar->dev);
+	if (ret)
+		return ret;
+
+	was_connected = dpxbar->selected_dispext[index] >= 0;
+	ret = set(mux, state);
+	connected = dpxbar->selected_dispext[index] >= 0;
+
+	/* A newly connected output keeps the reference taken above */
+	if (connected && !was_connected)
+		return ret;
+
+	if (was_connected && !connected)
+		pm_runtime_put(dpxbar->dev);
+	pm_runtime_put(dpxbar->dev);
+
+	return ret;
+}
+
+static int apple_dpxbar_set_t8103_pm(struct mux_control *mux, int state)
+{
+	return apple_dpxbar_set_pm(mux, state, apple_dpxbar_set);
+}
+
+static int apple_dpxbar_set_t602x_pm(struct mux_control *mux, int state)
+{
+	return apple_dpxbar_set_pm(mux, state, apple_dpxbar_set_t602x);
+}
+
 static const struct mux_control_ops apple_dpxbar_ops;
 
 static const u32 apple_dpxbar_atc_bits[MUX_MAX] = { ATC_DPPHY, ATC_DPIN0, ATC_DPIN1 };
@@ -649,6 +696,12 @@ int apple_dpxbar_preselect(struct mux_control *mux, int state)
 		return -EOPNOTSUPP;
 	}
 
+	/* An output that is not connected holds no runtime PM reference */
+	PM_RUNTIME_ACQUIRE(dpxbar->dev, pm);
+	ret = PM_RUNTIME_ACQUIRE_ERR(&pm);
+	if (ret)
+		return ret;
+
 	spin_lock_irqsave(&dpxbar->lock, flags);
 	/* a selected output already points at its source */
 	if (dpxbar->selected_dispext[index] >= 0)
@@ -666,11 +719,11 @@ int apple_dpxbar_preselect(struct mux_control *mux, int state)
 EXPORT_SYMBOL_GPL(apple_dpxbar_preselect);
 
 static const struct mux_control_ops apple_dpxbar_ops = {
-	.set = apple_dpxbar_set,
+	.set = apple_dpxbar_set_t8103_pm,
 };
 
 static const struct mux_control_ops apple_dpxbar_t602x_ops = {
-	.set = apple_dpxbar_set_t602x,
+	.set = apple_dpxbar_set_t602x_pm,
 };
 
 /*
@@ -695,6 +748,11 @@ int apple_dpxbar_tunnel_select_source(struct mux_control *mux, int state)
 		return -EINVAL;
 
 	xbar = mux_chip_priv(mux->chip);
+	PM_RUNTIME_ACQUIRE(xbar->dev, pm);
+	ret = PM_RUNTIME_ACQUIRE_ERR(&pm);
+	if (ret)
+		return ret;
+
 	spin_lock_irqsave(&xbar->lock, flags);
 	if (xbar->selected_dispext[index] >= 0 &&
 	    xbar->selected_dispext[index] != state) {
@@ -822,6 +880,27 @@ int apple_dpxbar_link_down(struct mux_control *mux)
 }
 EXPORT_SYMBOL_GPL(apple_dpxbar_link_down);
 
+/* Set up what the crossbar loses when it is powered off */
+static void apple_dpxbar_init_hw(struct apple_dpxbar *dpxbar)
+{
+	if (of_device_is_compatible(dpxbar->dev->of_node, "apple,t6020-display-crossbar"))
+		return;
+
+	readl(dpxbar->regs + UNK_TUNABLE);
+	writel(dpxbar->hw->tunable, dpxbar->regs + UNK_TUNABLE);
+	readl(dpxbar->regs + UNK_TUNABLE);
+}
+
+/* The mux chip is gone: drop the references of the outputs left connected */
+static void apple_dpxbar_release_pm(void *data)
+{
+	struct apple_dpxbar *dpxbar = data;
+
+	for (unsigned int i = 0; i < MUX_MAX; ++i)
+		if (dpxbar->selected_dispext[i] >= 0)
+			pm_runtime_put_noidle(dpxbar->dev);
+}
+
 static int apple_dpxbar_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -844,12 +923,7 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	dpxbar->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(dpxbar->regs))
 		return PTR_ERR(dpxbar->regs);
-
-	if (!of_device_is_compatible(dev->of_node, "apple,t6020-display-crossbar")) {
-		readl(dpxbar->regs + UNK_TUNABLE);
-		writel(hw->tunable, dpxbar->regs + UNK_TUNABLE);
-		readl(dpxbar->regs + UNK_TUNABLE);
-	}
+	platform_set_drvdata(pdev, dpxbar);
 
 	for (unsigned int i = 0; i < MUX_MAX; ++i) {
 		mux_chip->mux[i].states = hw->n_ufp;
@@ -857,12 +931,50 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 		dpxbar->selected_dispext[i] = -1;
 	}
 
+	/* Powered until probe is done, and afterwards while an output is connected */
+	pm_runtime_get_noresume(dev);
+	ret = devm_pm_runtime_set_active_enabled(dev);
+	if (ret)
+		goto err_put;
+	ret = devm_add_action_or_reset(dev, apple_dpxbar_release_pm, dpxbar);
+	if (ret)
+		goto err_put;
+
+	/*
+	 * Temporary, until the runtime PM of the port has been validated on
+	 * hardware: keep the crossbar powered by default, power/control "on".
+	 * Testers opt in by writing "auto".
+	 */
+	pm_runtime_forbid(dev);
+
+	apple_dpxbar_init_hw(dpxbar);
+
 	ret = devm_mux_chip_register(dev, mux_chip);
 	if (ret < 0)
-		return ret;
+		goto err_put;
+
+	pm_runtime_put(dev);
+	return 0;
+
+err_put:
+	pm_runtime_put_noidle(dev);
+	return ret;
+}
+
+/*
+ * The crossbar may have been powered off. Outputs are programmed from scratch
+ * when they are connected; the rest of what probe set up is restored here.
+ */
+static int apple_dpxbar_runtime_resume(struct device *dev)
+{
+	apple_dpxbar_init_hw(dev_get_drvdata(dev));
 
 	return 0;
 }
+
+static const struct dev_pm_ops apple_dpxbar_pm_ops = {
+	RUNTIME_PM_OPS(NULL, apple_dpxbar_runtime_resume, NULL)
+};
 
 static const struct apple_dpxbar_hw apple_dpxbar_hw_t8103 = {
 	.n_ufp = 2,
@@ -913,6 +1025,7 @@ static struct platform_driver apple_dpxbar_driver = {
 	.driver = {
 		.name = "apple-display-crossbar",
 		.of_match_table	= apple_dpxbar_ids,
+		.pm = pm_ptr(&apple_dpxbar_pm_ops),
 	},
 	.probe = apple_dpxbar_probe,
 };
