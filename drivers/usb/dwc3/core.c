@@ -2312,13 +2312,16 @@ int dwc3_core_probe(const struct dwc3_probe_data *data)
 	spin_lock_init(&dwc->lock);
 	mutex_init(&dwc->mutex);
 
-	pm_runtime_get_noresume(dev);
-	pm_runtime_set_active(dev);
-	pm_runtime_use_autosuspend(dev);
-	pm_runtime_set_autosuspend_delay(dev, DWC3_DEFAULT_AUTOSUSPEND_DELAY);
-	pm_runtime_enable(dev);
+	dwc->glue_runtime_pm = data->glue_runtime_pm;
+	if (!dwc->glue_runtime_pm) {
+		pm_runtime_get_noresume(dev);
+		pm_runtime_set_active(dev);
+		pm_runtime_use_autosuspend(dev);
+		pm_runtime_set_autosuspend_delay(dev, DWC3_DEFAULT_AUTOSUSPEND_DELAY);
+		pm_runtime_enable(dev);
 
-	pm_runtime_forbid(dev);
+		pm_runtime_forbid(dev);
+	}
 
 	ret = dwc3_alloc_event_buffers(dwc, DWC3_EVENT_BUFFERS_SIZE);
 	if (ret) {
@@ -2352,7 +2355,8 @@ int dwc3_core_probe(const struct dwc3_probe_data *data)
 			goto err_exit_debugfs;
 	}
 
-	pm_runtime_put(dev);
+	if (!dwc->glue_runtime_pm)
+		pm_runtime_put(dev);
 
 	dma_set_max_seg_size(dev, UINT_MAX);
 
@@ -2367,11 +2371,13 @@ err_exit_debugfs:
 err_free_event_buffers:
 	dwc3_free_event_buffers(dwc);
 err_allow_rpm:
-	pm_runtime_allow(dev);
-	pm_runtime_disable(dev);
-	pm_runtime_dont_use_autosuspend(dev);
-	pm_runtime_set_suspended(dev);
-	pm_runtime_put_noidle(dev);
+	if (!dwc->glue_runtime_pm) {
+		pm_runtime_allow(dev);
+		pm_runtime_disable(dev);
+		pm_runtime_dont_use_autosuspend(dev);
+		pm_runtime_set_suspended(dev);
+		pm_runtime_put_noidle(dev);
+	}
 err_disable_clks:
 	dwc3_clk_disable(dwc);
 err_assert_reset:
@@ -2412,7 +2418,8 @@ static int dwc3_probe(struct platform_device *pdev)
 
 void dwc3_core_remove(struct dwc3 *dwc)
 {
-	pm_runtime_get_sync(dwc->dev);
+	if (!dwc->glue_runtime_pm)
+		pm_runtime_get_sync(dwc->dev);
 
 	dwc3_core_exit_mode(dwc);
 	dwc3_debugfs_exit(dwc);
@@ -2420,16 +2427,19 @@ void dwc3_core_remove(struct dwc3 *dwc)
 	dwc3_core_exit(dwc);
 	dwc3_ulpi_exit(dwc);
 
-	pm_runtime_allow(dwc->dev);
-	pm_runtime_disable(dwc->dev);
-	pm_runtime_dont_use_autosuspend(dwc->dev);
-	pm_runtime_put_noidle(dwc->dev);
+	if (!dwc->glue_runtime_pm) {
+		pm_runtime_allow(dwc->dev);
+		pm_runtime_disable(dwc->dev);
+		pm_runtime_dont_use_autosuspend(dwc->dev);
+		pm_runtime_put_noidle(dwc->dev);
+	}
 	/*
 	 * HACK: Clear the driver data, which is currently accessed by parent
 	 * glue drivers, before allowing the parent to suspend.
 	 */
 	dev_set_drvdata(dwc->dev, NULL);
-	pm_runtime_set_suspended(dwc->dev);
+	if (!dwc->glue_runtime_pm)
+		pm_runtime_set_suspended(dwc->dev);
 
 	dwc3_free_event_buffers(dwc);
 
