@@ -14,6 +14,7 @@
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
+#include <linux/pm_runtime.h>
 #include <linux/reset.h>
 
 #include "dwc3-apple-state.h"
@@ -78,6 +79,12 @@
  * Type-C mux for the SuperSpeed lanes, and the PHY follows those mode changes on its own.
  * Across system sleep such a controller goes through DWC3_APPLE_SUSPENDED: the core is exited
  * and initialised again around the sleep while xhci stays registered, see dwc3_apple_suspend().
+ *
+ * Runtime PM follows the same model. The device is runtime active while the controller has a
+ * role, which a controller behind a fixed hub always has, and suspended otherwise, so that its
+ * power domain, the PHY and the DARTs can power down while no cable is connected. There is
+ * nothing to save or restore around that: every role change brings the core up from scratch.
+ * This driver owns runtime PM of the device and has dwc3_core_probe() leave it alone.
  *
  * enum dwc3_apple_state is defined in dwc3-apple-state.h.
  */
@@ -196,6 +203,7 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 	probe_data.res = appledwc->mmio_resource;
 	probe_data.ignore_clocks_and_resets = true;
 	probe_data.skip_core_init_mode = true;
+	probe_data.glue_runtime_pm = true;
 	probe_data.properties = DWC3_DEFAULT_PROPERTIES;
 
 	/*
@@ -343,9 +351,16 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 
 	lockdep_assert_held(&appledwc->lock);
 
+	/* The controller is powered while a role is up; dwc3_apple_exit() drops this */
+	ret = pm_runtime_resume_and_get(appledwc->dev);
+	if (ret) {
+		dev_err(appledwc->dev, "Failed to resume, err=%d\n", ret);
+		return ret;
+	}
+
 	ret = dwc3_apple_core_start(appledwc, state);
 	if (ret)
-		return ret;
+		goto err_put;
 
 	dwc3_apple_set_role(appledwc, state);
 
@@ -390,6 +405,8 @@ core_exit:
 	ret_reset = reset_control_assert(appledwc->reset);
 	if (ret_reset)
 		dev_warn(appledwc->dev, "Failed to assert reset, err=%d\n", ret_reset);
+err_put:
+	pm_runtime_put(appledwc->dev);
 
 	return ret;
 }
@@ -419,6 +436,7 @@ static int dwc3_apple_exit(struct dwc3_apple *appledwc)
 		/* The core is exited and the reset asserted already, see dwc3_apple_suspend() */
 		dwc3_host_exit(&appledwc->dwc);
 		appledwc->state = DWC3_APPLE_NO_CABLE;
+		pm_runtime_put(appledwc->dev);
 		return 0;
 	}
 
@@ -432,12 +450,12 @@ static int dwc3_apple_exit(struct dwc3_apple *appledwc)
 	appledwc->state = DWC3_APPLE_NO_CABLE;
 
 	ret = reset_control_assert(appledwc->reset);
-	if (ret) {
+	if (ret)
 		dev_err(appledwc->dev, "Failed to assert reset, err=%d\n", ret);
-		return ret;
-	}
 
-	return 0;
+	pm_runtime_put(appledwc->dev);
+
+	return ret;
 }
 
 static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role role)
@@ -589,12 +607,35 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 * details.
 	 */
 	appledwc->state = DWC3_APPLE_PROBE_PENDING;
-	ret = dwc3_apple_setup_role_switch(appledwc);
-	if (ret)
-		return dev_err_probe(&pdev->dev, ret, "Failed to setup role switch\n");
 
-	if (!appledwc->fixed_hub)
+	/*
+	 * The controller is powered only while it has a role, see dwc3_apple_init(). It is on
+	 * now: start out active and suspend once probe is done. That suspend also drops the
+	 * hold the device links of the IOMMU take on the DARTs until their consumer suspends.
+	 */
+	pm_runtime_get_noresume(dev);
+	ret = devm_pm_runtime_set_active_enabled(dev);
+	if (ret) {
+		pm_runtime_put_noidle(dev);
+		return ret;
+	}
+
+	/*
+	 * Temporary, until the runtime PM of the port has been validated on hardware: keep the
+	 * controller powered by default, power/control "on". Testers opt in by writing "auto".
+	 */
+	pm_runtime_forbid(dev);
+
+	ret = dwc3_apple_setup_role_switch(appledwc);
+	if (ret) {
+		pm_runtime_put_noidle(dev);
+		return dev_err_probe(&pdev->dev, ret, "Failed to setup role switch\n");
+	}
+
+	if (!appledwc->fixed_hub) {
+		pm_runtime_put(dev);
 		return 0;
+	}
 
 	/*
 	 * The hub is the controller's permanent USB2 peer, and the PHY has kept
@@ -608,9 +649,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		if (appledwc->state != DWC3_APPLE_PROBE_PENDING)
 			dwc3_core_remove(&appledwc->dwc);
 		usb_role_switch_unregister(appledwc->role_sw);
+		pm_runtime_put_noidle(dev);
 		return dev_err_probe(dev, ret, "Failed to start host mode\n");
 	}
 
+	pm_runtime_put(dev);
 	return 0;
 }
 
@@ -629,8 +672,12 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 	 * dwc3_apple_exit can be called unconditionally because it checks the state itself.
 	 */
 	dwc3_apple_exit(appledwc);
-	if (appledwc->state != DWC3_APPLE_PROBE_PENDING)
+	if (appledwc->state != DWC3_APPLE_PROBE_PENDING) {
+		/* dwc3_core_remove() accesses the core */
+		pm_runtime_get_sync(appledwc->dev);
 		dwc3_core_remove(&appledwc->dwc);
+		pm_runtime_put_sync(appledwc->dev);
+	}
 }
 
 static const struct of_device_id dwc3_apple_of_match[] = {
