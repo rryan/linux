@@ -180,6 +180,9 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	if (!(msg & APPLE_RTKIT_MGMT_EPMAP_LAST))
 		return;
 
+	/* Starting the crashlog endpoint makes it ask for its buffer again. */
+	rtk->crashlog_requested = false;
+
 	for_each_set_bit(ep, rtk->endpoints, APPLE_RTKIT_APP_ENDPOINT_START) {
 		switch (ep) {
 		/* the management endpoint is started by default */
@@ -414,7 +417,13 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 		return;
 	}
 
-	if (!rtk->crashlog_buffer.size) {
+	/*
+	 * The buffer request and the crash report are the same message: the
+	 * first one since the endpoint was started asks for the buffer, also
+	 * when the buffer was kept across apple_rtkit_sleep().
+	 */
+	if (!rtk->crashlog_requested || !rtk->crashlog_buffer.size) {
+		rtk->crashlog_requested = true;
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
 						 APPLE_RTKIT_EP_CRASHLOG, msg);
 		return;
@@ -688,6 +697,13 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
 		return -EINVAL;
 	}
 
+	/* The mailbox may be powered off. */
+	if (READ_ONCE(rtk->asleep)) {
+		dev_warn(rtk->dev,
+			 "RTKit: Co-processor is asleep, cannot send message\n");
+		return -EINVAL;
+	}
+
 	if (ep >= APPLE_RTKIT_APP_ENDPOINT_START &&
 	    !apple_rtkit_is_running(rtk)) {
 		dev_warn(rtk->dev,
@@ -901,11 +917,40 @@ static int apple_rtkit_wait_for_completion(struct completion *c)
 		return 0;
 }
 
-int apple_rtkit_reinit(struct apple_rtkit *rtk)
+/*
+ * Expect a new boot handshake, deliver messages again and start the mailbox,
+ * after apple_rtkit_detach_rx().
+ */
+static int apple_rtkit_attach(struct apple_rtkit *rtk)
 {
 	unsigned long flags;
 	int ret;
 
+	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
+	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
+
+	reinit_completion(&rtk->epmap_completion);
+	reinit_completion(&rtk->iop_pwr_ack_completion);
+	reinit_completion(&rtk->ap_pwr_ack_completion);
+
+	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
+	WRITE_ONCE(rtk->shutting_down, false);
+	rtk->mbox->rx = apple_rtkit_rx;
+	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+
+	ret = apple_mbox_start(rtk->mbox);
+	if (ret) {
+		apple_rtkit_detach_rx(rtk);
+		flush_workqueue(rtk->wq);
+		return ret;
+	}
+
+	WRITE_ONCE(rtk->asleep, false);
+	return 0;
+}
+
+int apple_rtkit_reinit(struct apple_rtkit *rtk)
+{
 	/* make sure we don't handle any messages while reinitializing */
 	apple_rtkit_detach_rx(rtk);
 	flush_workqueue(rtk->wq);
@@ -923,28 +968,11 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	rtk->syslog_inherited = false;
 	rtk->crashlog_inherited = false;
 
-	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
-	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
-
-	reinit_completion(&rtk->epmap_completion);
-	reinit_completion(&rtk->iop_pwr_ack_completion);
-	reinit_completion(&rtk->ap_pwr_ack_completion);
-
 	rtk->crashed = false;
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 
-	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
-	WRITE_ONCE(rtk->shutting_down, false);
-	rtk->mbox->rx = apple_rtkit_rx;
-	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
-
-	ret = apple_mbox_start(rtk->mbox);
-	if (ret) {
-		apple_rtkit_detach_rx(rtk);
-		flush_workqueue(rtk->wq);
-	}
-	return ret;
+	return apple_rtkit_attach(rtk);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_reinit);
 
@@ -1029,7 +1057,7 @@ int apple_rtkit_adopt_running(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_adopt_running);
 
-int apple_rtkit_shutdown(struct apple_rtkit *rtk)
+static int apple_rtkit_enter_sleep(struct apple_rtkit *rtk)
 {
 	int ret;
 
@@ -1039,13 +1067,42 @@ int apple_rtkit_shutdown(struct apple_rtkit *rtk)
 	if (ret)
 		return ret;
 
-	ret = apple_rtkit_set_iop_power_state(rtk, APPLE_RTKIT_PWR_STATE_SLEEP);
+	return apple_rtkit_set_iop_power_state(rtk, APPLE_RTKIT_PWR_STATE_SLEEP);
+}
+
+int apple_rtkit_shutdown(struct apple_rtkit *rtk)
+{
+	int ret;
+
+	ret = apple_rtkit_enter_sleep(rtk);
 	if (ret)
 		return ret;
 
 	return apple_rtkit_reinit(rtk);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_shutdown);
+
+int apple_rtkit_sleep(struct apple_rtkit *rtk)
+{
+	int ret;
+
+	ret = apple_rtkit_enter_sleep(rtk);
+	if (ret)
+		return ret;
+
+	/*
+	 * The firmware sends nothing until it is woken up again: stop the
+	 * mailbox, which lets it runtime suspend along with any power domain
+	 * it shares with the co-processor.  Everything else is kept for
+	 * apple_rtkit_wake().
+	 */
+	apple_rtkit_detach_rx(rtk);
+	flush_workqueue(rtk->wq);
+	WRITE_ONCE(rtk->asleep, true);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_sleep);
 
 int apple_rtkit_poweroff(struct apple_rtkit *rtk)
 {
@@ -1114,6 +1171,12 @@ int apple_rtkit_wake(struct apple_rtkit *rtk)
 
 	if (apple_rtkit_is_running(rtk))
 		return -EINVAL;
+
+	if (READ_ONCE(rtk->asleep)) {
+		ret = apple_rtkit_attach(rtk);
+		if (ret)
+			return ret;
+	}
 
 	reinit_completion(&rtk->iop_pwr_ack_completion);
 

@@ -161,7 +161,9 @@ int apple_rtkit_adopt_running(struct apple_rtkit *rtk);
 int apple_rtkit_quiesce(struct apple_rtkit *rtk);
 
 /*
- * Wake the co-processor up from hibernation mode.
+ * Wake the co-processor up from hibernation mode, or from apple_rtkit_sleep():
+ * start the mailbox again, then run the boot handshake. The application
+ * endpoints have to be started again with apple_rtkit_start_ep().
  */
 int apple_rtkit_wake(struct apple_rtkit *rtk);
 
@@ -169,6 +171,14 @@ int apple_rtkit_wake(struct apple_rtkit *rtk);
  * Shutdown the co-processor
  */
 int apple_rtkit_shutdown(struct apple_rtkit *rtk);
+
+/*
+ * Put the co-processor to sleep, as apple_rtkit_shutdown() does, and stop the
+ * mailbox until apple_rtkit_wake(). Unlike apple_rtkit_shutdown(), the buffers
+ * shared with the firmware are kept: a sleeping firmware keeps its state and
+ * uses them again once woken up. The caller may stop the CPU afterwards.
+ */
+int apple_rtkit_sleep(struct apple_rtkit *rtk);
 
 /*
  * Put the co-processor into the lowest power state. Note that it usually

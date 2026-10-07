@@ -40,6 +40,10 @@ struct apple_rtkit {
 	unsigned int ap_power_state;
 	bool crashed;
 	bool shutting_down;
+	/* apple_rtkit_sleep() released the mailbox until apple_rtkit_wake(). */
+	bool asleep;
+	/* The crashlog endpoint asked for its buffer since it was started. */
+	bool crashlog_requested;
 
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 
