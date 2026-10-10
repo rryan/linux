@@ -100,6 +100,7 @@ enum apple_smc_boot_stage {
  * @cmd_ret: Return value from SMC for last command
  * @mutex: Mutex for non-atomic mode
  * @lock: Spinlock for atomic mode
+ * @sleep_announced: MBSE = 'slpa' was sent at suspend; send 'waka' at resume
  */
 struct apple_smc {
 	struct device *dev;
@@ -128,6 +129,8 @@ struct apple_smc {
 
 	struct mutex mutex;
 	spinlock_t lock;
+
+	bool sleep_announced;
 };
 
 /**

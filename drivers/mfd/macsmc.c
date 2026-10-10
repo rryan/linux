@@ -13,11 +13,13 @@
 #include <linux/math.h>
 #include <linux/mfd/core.h>
 #include <linux/mfd/macsmc.h>
+#include <linux/moduleparam.h>
 #include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/unaligned.h>
 
@@ -503,6 +505,70 @@ static int apple_smc_probe(struct platform_device *pdev)
 	return 0;
 }
 
+/*
+ * Sleep handshake: after the children have suspended, write WKTP = 2 and
+ * announce sleep with MBSE = 'slpa'. The SMC acknowledges it by setting bit 16
+ * of the status word read back from MBSE. On resume, read the MBSW wake-reason
+ * bitmap and announce the wake with MBSE = 'waka', which clears that bit.
+ *
+ * The announcement only tells the SMC that the system is asleep; it does not
+ * by itself power anything down under s2idle. It can be disabled with the
+ * sleep_handshake module parameter. MBSW is read-only and always logged.
+ */
+static bool sleep_handshake = true;
+module_param(sleep_handshake, bool, 0644);
+MODULE_PARM_DESC(sleep_handshake, "Announce system sleep and wake to the SMC (default: on)");
+
+static int apple_smc_suspend(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+	int ret;
+
+	smc->sleep_announced = false;
+	if (!sleep_handshake)
+		return 0;
+
+	if (apple_smc_key_exists(smc, SMC_KEY(WKTP))) {
+		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), 2);
+		if (ret < 0)
+			dev_warn(dev, "Failed to write WKTP (%d)\n", ret);
+	}
+
+	ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpa));
+	if (ret < 0) {
+		dev_warn(dev, "Failed to announce sleep (MBSE = slpa): %d\n", ret);
+		return 0;
+	}
+	smc->sleep_announced = true;
+
+	return 0;
+}
+
+static int apple_smc_resume(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+	u64 wake_reasons;
+	int ret;
+
+	ret = apple_smc_read_u64(smc, SMC_KEY(MBSW), &wake_reasons);
+	if (ret < 0)
+		dev_dbg(dev, "Failed to read MBSW (%d)\n", ret);
+	else
+		dev_info(dev, "SMC wake reasons (MBSW): %#018llx\n", wake_reasons);
+
+	if (!smc->sleep_announced)
+		return 0;
+	smc->sleep_announced = false;
+
+	ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(waka));
+	if (ret < 0)
+		dev_warn(dev, "Failed to announce wake (MBSE = waka): %d\n", ret);
+
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(apple_smc_pm_ops, apple_smc_suspend, apple_smc_resume);
+
 static const struct of_device_id apple_smc_of_match[] = {
 	{ .compatible = "apple,t8103-smc" },
 	{ .compatible = "apple,smc" },
@@ -514,6 +580,7 @@ static struct platform_driver apple_smc_driver = {
 	.driver = {
 		.name = "macsmc",
 		.of_match_table = apple_smc_of_match,
+		.pm = pm_sleep_ptr(&apple_smc_pm_ops),
 	},
 	.probe = apple_smc_probe,
 };
