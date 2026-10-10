@@ -15,6 +15,7 @@
 #include <linux/regmap.h>
 #include <linux/mfd/syscon.h>
 #include <linux/reset-controller.h>
+#include <linux/suspend.h>
 #include <linux/module.h>
 
 #define APPLE_PMGR_RESET        BIT(31)
@@ -351,12 +352,42 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	if (ret < 0)
 		goto err_remove;
 
+	platform_set_drvdata(pdev, ps);
+
 	return 0;
 err_remove:
 	of_genpd_del_provider(node);
 	pm_genpd_remove(&ps->genpd);
 	return ret;
 }
+
+/*
+ * Debug aid for finding SoC blocks left powered through system sleep: with
+ * /sys/power/pm_debug_messages enabled, report every domain that is still
+ * powered when the system enters sleep. The consumers' genpd noirq suspend
+ * has run by now, since the power state devices are registered first.
+ */
+static int apple_pmgr_ps_suspend_noirq(struct device *dev)
+{
+	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
+	u32 reg;
+
+	if (regmap_read(ps->regmap, ps->offset, &reg))
+		return 0;
+
+	if (FIELD_GET(APPLE_PMGR_PS_ACTUAL, reg) != APPLE_PMGR_PS_PWRGATE)
+		pm_pr_dbg("PMGR domain %s on at suspend: actual %lu target %lu%s%s\n",
+			  ps->genpd.name, FIELD_GET(APPLE_PMGR_PS_ACTUAL, reg),
+			  FIELD_GET(APPLE_PMGR_PS_TARGET, reg),
+			  reg & APPLE_PMGR_AUTO_ENABLE ? " auto" : "",
+			  ps->genpd.flags & GENPD_FLAG_ALWAYS_ON ? " always-on" : "");
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_pmgr_ps_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_pmgr_ps_suspend_noirq, NULL)
+};
 
 static const struct of_device_id apple_pmgr_ps_of_match[] = {
 	{ .compatible = "apple,t8103-pmgr-pwrstate" },
@@ -371,6 +402,7 @@ static struct platform_driver apple_pmgr_ps_driver = {
 	.driver = {
 		.name = "apple-pmgr-pwrstate",
 		.of_match_table = apple_pmgr_ps_of_match,
+		.pm = pm_sleep_ptr(&apple_pmgr_ps_pm_ops),
 	},
 };
 
