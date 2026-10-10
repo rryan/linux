@@ -5,13 +5,17 @@
 //! Copyright (C) The Asahi Linux Contributors
 
 use kernel::{
-    bindings, c_str,
-    device::Core,
+    bindings, c_str, container_of,
+    device::{self, Core},
+    error::to_result,
+    ffi::{c_int, c_ulong, c_void},
     firmware::Firmware,
     iio::common::aop_sensors::{AopSensorData, IIORegistration, MessageProcessor, MICRO},
     module_platform_driver, of, platform,
     prelude::*,
     soc::apple::aop::{EPICService, FakehidRegistration, AOP},
+    sync::{aref::ARef, Arc},
+    types::Opaque,
 };
 
 const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
@@ -65,15 +69,17 @@ fn get_lux_offset(aop: &dyn AOP, dev: &platform::Device, svc: &EPICService) -> R
     }
 }
 
-fn enable_als(
-    aop: &dyn AOP,
-    dev: &platform::Device,
-    svc: &EPICService,
-    offset: usize,
-) -> Result<()> {
+fn enable_als(aop: &dyn AOP, dev: &device::Device, svc: &EPICService, offset: usize) -> Result<()> {
     if offset != LUX_OFFSET_CT817 {
-        let fw = Firmware::request(c_str!("apple/aop-als-cal.bin"), dev.as_ref())?;
+        let fw = Firmware::request(c_str!("apple/aop-als-cal.bin"), dev)?;
         set_als_property(aop, svc, ALS_PROP_CALIBRATION, fw.data())?;
+    }
+    arm_als(aop, dev, svc, offset)
+}
+
+/// Starts the sensor's periodic reports.
+fn arm_als(aop: &dyn AOP, dev: &device::Device, svc: &EPICService, offset: usize) -> Result<()> {
+    if offset != LUX_OFFSET_CT817 {
         set_als_property(aop, svc, ALS_PROP_INTERVAL, &ALS_INTERVAL_US.to_le_bytes())?;
         return Ok(());
     }
@@ -86,13 +92,7 @@ fn enable_als(
     // wedges the AOP for the rest of the boot.
     let set = |tag: u32, val: u32, what: &str| -> Result<()> {
         let status = set_als_property(aop, svc, tag, &val.to_le_bytes())?;
-        dev_dbg!(
-            dev.as_ref(),
-            "{} = {:#x}: status {:#x}\n",
-            what,
-            val,
-            status
-        );
+        dev_dbg!(dev, "{} = {:#x}: status {:#x}\n", what, val, status);
         Ok(())
     };
     set(ALS_PROP_VERBOSITY, ALS_VERBOSITY, "verbosity")?;
@@ -102,9 +102,100 @@ fn enable_als(
         "batch interval",
     )?;
     set(ALS_PROP_RAW_INTERVAL, ALS_RAW_INTERVAL, "raw interval")?;
-    // The interval is zero at probe, so this is the transition that arms the
-    // sensor.
+    // The interval is zero at probe and after disarm_als(), so this is the
+    // transition that arms the sensor.
     set(ALS_PROP_INTERVAL, ALS_INTERVAL_US, "interval")
+}
+
+/// Stops the sensor's periodic reports. Each report wakes the AP, so they
+/// must not run while the system is asleep.
+fn disarm_als(aop: &dyn AOP, svc: &EPICService) -> Result<()> {
+    set_als_property(aop, svc, ALS_PROP_INTERVAL, &0u32.to_le_bytes()).map(|_| ())
+}
+
+/// Stops the reports for the duration of system sleep and restarts them on
+/// resume.
+#[pin_data(PinnedDrop)]
+struct SleepNotifier {
+    aop: Arc<dyn AOP>,
+    dev: ARef<device::Device>,
+    svc: EPICService,
+    offset: usize,
+    /// Initialized last: registering it makes the callback live.
+    #[pin]
+    nb: Opaque<bindings::notifier_block>,
+}
+
+impl SleepNotifier {
+    fn new(
+        aop: Arc<dyn AOP>,
+        dev: ARef<device::Device>,
+        svc: EPICService,
+        offset: usize,
+    ) -> impl PinInit<Self, Error> {
+        try_pin_init!(Self {
+            aop,
+            dev,
+            svc,
+            offset,
+            nb <- Opaque::try_ffi_init(|slot: *mut bindings::notifier_block| {
+                // SAFETY: `slot` is valid for writes and pinned for the life of
+                // `Self`; it is unregistered in `drop` before it goes away.
+                unsafe {
+                    slot.write(bindings::notifier_block {
+                        notifier_call: Some(Self::callback),
+                        ..Default::default()
+                    });
+                    to_result(bindings::register_pm_notifier(slot))
+                }
+            }),
+        })
+    }
+
+    /// # Safety
+    ///
+    /// Only called by the PM notifier chain, with `nb` pointing at the `nb`
+    /// field of a registered `SleepNotifier`.
+    unsafe extern "C" fn callback(
+        nb: *mut bindings::notifier_block,
+        action: c_ulong,
+        _data: *mut c_void,
+    ) -> c_int {
+        // SAFETY: `nb` is the `nb` field of a registered, pinned `SleepNotifier`.
+        let this =
+            unsafe { &*container_of!(nb.cast::<Opaque<bindings::notifier_block>>(), Self, nb) };
+        let ret = match action as u32 {
+            bindings::PM_SUSPEND_PREPARE | bindings::PM_HIBERNATION_PREPARE => {
+                disarm_als(this.aop.as_ref(), &this.svc)
+            }
+            bindings::PM_POST_SUSPEND | bindings::PM_POST_HIBERNATION => {
+                arm_als(this.aop.as_ref(), &this.dev, &this.svc, this.offset)
+            }
+            _ => return bindings::NOTIFY_DONE as c_int,
+        };
+        if let Err(e) = ret {
+            dev_warn!(
+                this.dev,
+                "Failed to switch ALS reports for sleep: {:?}\n",
+                e
+            );
+        }
+        bindings::NOTIFY_OK as c_int
+    }
+}
+
+// SAFETY: The notifier block is only touched by the PM notifier chain, which
+// serializes its callers; the other fields are `Send` and `Sync`.
+unsafe impl Send for SleepNotifier {}
+// SAFETY: See `Send`.
+unsafe impl Sync for SleepNotifier {}
+
+#[pinned_drop]
+impl PinnedDrop for SleepNotifier {
+    fn drop(self: Pin<&mut Self>) {
+        // SAFETY: `nb` was registered in `new`.
+        unsafe { bindings::unregister_pm_notifier(self.nb.get()) };
+    }
 }
 
 fn get_aop_property(
@@ -163,7 +254,9 @@ impl MessageProcessor for MsgProc {
 }
 
 struct IIOAopAlsDriver {
-    /// Declared first: the subscription ends before the IIO device goes.
+    /// Declared first: no sleep transition touches the sensor once unbinding starts.
+    _sleep: Pin<KBox<SleepNotifier>>,
+    /// The subscription ends before the IIO device goes.
     listener: FakehidRegistration,
     _iio: IIORegistration<MsgProc>,
 }
@@ -197,11 +290,16 @@ impl platform::Driver for IIOAopAlsDriver {
         let offset = get_lux_offset(adata.as_ref(), pdev, &service)?;
         let data = AopSensorData::new(dev.into(), ty, MsgProc(offset))?;
         let listener = FakehidRegistration::new(adata.clone(), service, data.clone())?;
-        enable_als(adata.as_ref(), pdev, &service, offset)?;
+        enable_als(adata.as_ref(), dev, &service, offset)?;
+        let sleep = KBox::pin_init(
+            SleepNotifier::new(adata.clone(), dev.into(), service, offset),
+            GFP_KERNEL,
+        )?;
         let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED;
         let iio =
             IIORegistration::<MsgProc>::new(data, c"aop-sensors-als", ty, info_mask, &THIS_MODULE)?;
         Ok(IIOAopAlsDriver {
+            _sleep: sleep,
             listener,
             _iio: iio,
         })
