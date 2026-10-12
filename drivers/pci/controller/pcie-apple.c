@@ -733,10 +733,6 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 		};
 		int irq, ret;
 
-		/* Only seen on the PCIe-C tunnel ports so far. */
-		if (port_irqs[i].hwirq == PORT_INT_PME && !port->pcie->hw->tunneled)
-			continue;
-
 		irq = irq_domain_alloc_irqs(port->domain, 1, NUMA_NO_NODE,
 					    &fwspec);
 		if (irq <= 0)
