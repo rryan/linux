@@ -56,6 +56,7 @@
 #include <linux/limits.h>
 #include <linux/of_address.h>
 #include <linux/slab.h>
+#include <linux/syscore_ops.h>
 #include <asm/apple_m1_pmu.h>
 #include <asm/cputype.h>
 #include <asm/exception.h>
@@ -344,6 +345,11 @@ struct aic_irq_chip {
 	int max_die;
 
 	struct aic_info info;
+
+	/* AICv2 state saved across system sleep; the controller loses it */
+	u32 *pm_irq_cfg;
+	u32 *pm_mask;
+	u32 pm_config;
 };
 
 static DEFINE_PER_CPU(uint32_t, aic_fiq_unmasked);
@@ -858,7 +864,7 @@ static int __init aic_init_smp(struct aic_irq_chip *irqc, struct device_node *no
 	return 0;
 }
 
-static int aic_init_cpu(unsigned int cpu)
+static void aic_init_cpu_sysregs(void)
 {
 	/* Mask all hard-wired per-CPU IRQ/FIQ sources */
 
@@ -892,6 +898,11 @@ static int aic_init_cpu(unsigned int cpu)
 
 	/* Commit all of the above */
 	isb();
+}
+
+static int aic_init_cpu(unsigned int cpu)
+{
+	aic_init_cpu_sysregs();
 
 	if (aic_irqc->info.version == 1) {
 		/*
@@ -920,6 +931,99 @@ static int aic_init_cpu(unsigned int cpu)
 
 	return 0;
 }
+
+#ifdef CONFIG_PM_SLEEP
+/*
+ * AICv2 loses CONFIG, IRQ_CFG and the mask bits when the SoC enters
+ * suspend-to-RAM. Save them and mask every interrupt on the way down; restore
+ * them before interrupts are re-enabled on the way up.
+ */
+static int aic2_suspend(void *data)
+{
+	struct aic_irq_chip *ic = data;
+	u32 *cfg = ic->pm_irq_cfg, *mask = ic->pm_mask;
+	u32 off = 0;
+	int die, i;
+
+	for (die = 0; die < ic->nr_die; die++) {
+		for (i = 0; i < BITS_TO_U32(ic->nr_irq); i++) {
+			/* MASK_CLR reads back the current mask */
+			*mask++ = aic_ic_read(ic, ic->info.mask_clr + off + i * 4);
+			aic_ic_write(ic, ic->info.mask_set + off + i * 4, U32_MAX);
+		}
+		for (i = 0; i < ic->nr_irq; i++)
+			*cfg++ = aic_ic_read(ic, ic->info.irq_cfg + off + i * 4);
+		off += ic->info.die_stride;
+	}
+
+	ic->pm_config = aic_ic_read(ic, AIC2_CONFIG);
+
+	return 0;
+}
+
+static void aic2_resume(void *data)
+{
+	struct aic_irq_chip *ic = data;
+	u32 *cfg = ic->pm_irq_cfg, *mask = ic->pm_mask;
+	u32 off = 0;
+	int die, i;
+
+	aic_ic_write(ic, AIC2_CONFIG, ic->pm_config);
+
+	for (die = 0; die < ic->nr_die; die++) {
+		for (i = 0; i < ic->nr_irq; i++)
+			aic_ic_write(ic, ic->info.irq_cfg + off + i * 4, *cfg++);
+		for (i = 0; i < BITS_TO_U32(ic->nr_irq); i++, mask++) {
+			aic_ic_write(ic, ic->info.mask_set + off + i * 4, *mask);
+			aic_ic_write(ic, ic->info.mask_clr + off + i * 4, ~*mask);
+		}
+		off += ic->info.die_stride;
+	}
+
+	/*
+	 * The boot CPU went through reset as well: mask its hard-wired FIQ
+	 * sources again, then re-enable the guest timer FIQs that are unmasked.
+	 */
+	aic_init_cpu_sysregs();
+	if (is_kernel_in_hyp_mode()) {
+		u32 unmasked = __this_cpu_read(aic_fiq_unmasked);
+		u64 ena = 0;
+
+		if (unmasked & BIT(AIC_TMR_EL02_PHYS))
+			ena |= VM_TMR_FIQ_ENABLE_P;
+		if (unmasked & BIT(AIC_TMR_EL02_VIRT))
+			ena |= VM_TMR_FIQ_ENABLE_V;
+		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, 0, ena);
+		isb();
+	}
+}
+
+static const struct syscore_ops aic2_syscore_ops = {
+	.suspend = aic2_suspend,
+	.resume = aic2_resume,
+};
+
+static struct syscore aic2_syscore = {
+	.ops = &aic2_syscore_ops,
+};
+
+static void __init aic2_init_pm(struct aic_irq_chip *ic)
+{
+	ic->pm_irq_cfg = kcalloc(ic->nr_die * ic->nr_irq, sizeof(u32), GFP_KERNEL);
+	ic->pm_mask = kcalloc(ic->nr_die * BITS_TO_U32(ic->nr_irq), sizeof(u32), GFP_KERNEL);
+	if (!ic->pm_irq_cfg || !ic->pm_mask) {
+		kfree(ic->pm_irq_cfg);
+		kfree(ic->pm_mask);
+		pr_warn("Failed to allocate the sleep state save area\n");
+		return;
+	}
+
+	aic2_syscore.data = ic;
+	register_syscore(&aic2_syscore);
+}
+#else
+static inline void aic2_init_pm(struct aic_irq_chip *ic) { }
+#endif
 
 static struct gic_kvm_info vgic_info __initdata = {
 	.type			= GIC_V3,
@@ -1090,6 +1194,9 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 		config |= AIC2_CONFIG_ENABLE;
 		aic_ic_write(irqc, AIC2_CONFIG, config);
 	}
+
+	if (irqc->info.version == 2)
+		aic2_init_pm(irqc);
 
 	if (!is_kernel_in_hyp_mode())
 		pr_info("Kernel running in EL1, mapping interrupts");
