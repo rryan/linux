@@ -9,19 +9,43 @@
 #include <linux/bitfield.h>
 #include <linux/err.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/module.h>
 
 #define APPLE_CLKGEN_PSTATE 0
 #define APPLE_CLKGEN_PSTATE_DESIRED GENMASK(3, 0)
+#define APPLE_CLKGEN_PSTATE_BUSY BIT(31)
+
+#define APPLE_CLKGEN_PSTATE_TIMEOUT_US 8000
 
 #define SYS_DEV_PSTATE_SUSPEND 1
+
+/* Placeholder in a pstate sequence for the pstate found at probe */
+#define SYS_DEV_PSTATE_BOOT U32_MAX
+
+static bool staged_pstate;
+module_param(staged_pstate, bool, 0644);
+MODULE_PARM_DESC(staged_pstate,
+		 "Walk fabric/DCS through the SoC's staged sleep pstate sequence, waiting for each transition (default: off)");
 
 enum sys_device {
 	DEV_FABRIC,
 	DEV_DCS,
 	DEV_MAX,
+};
+
+struct apple_pmgr_pstate_step {
+	enum sys_device dev;
+	u32 pstate;
+};
+
+struct apple_pmgr_misc_hw {
+	const struct apple_pmgr_pstate_step *suspend;
+	unsigned int n_suspend;
+	const struct apple_pmgr_pstate_step *resume;
+	unsigned int n_resume;
 };
 
 struct apple_pmgr_sys_device {
@@ -32,6 +56,8 @@ struct apple_pmgr_sys_device {
 
 struct apple_pmgr_misc {
 	struct device *dev;
+	const struct apple_pmgr_misc_hw *hw;
+	bool staged;
 	struct apple_pmgr_sys_device devices[DEV_MAX];
 };
 
@@ -57,10 +83,88 @@ static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
 	writel_relaxed(val, misc->devices[dev].base);
 }
 
+/*
+ * Request a pstate and wait for the clock generator to finish the
+ * transition (busy bit clear) before the next one is requested.
+ */
+static int apple_pmgr_sys_dev_step(struct apple_pmgr_misc *misc,
+				   const struct apple_pmgr_pstate_step *step)
+{
+	struct apple_pmgr_sys_device *sdev = &misc->devices[step->dev];
+	void __iomem *reg = sdev->base + APPLE_CLKGEN_PSTATE;
+	u32 pstate = step->pstate;
+	u32 val;
+	int ret;
+
+	if (pstate == SYS_DEV_PSTATE_BOOT)
+		pstate = sdev->active_state;
+
+	val = readl_relaxed(reg);
+	val &= ~APPLE_CLKGEN_PSTATE_DESIRED;
+	val |= FIELD_PREP(APPLE_CLKGEN_PSTATE_DESIRED, pstate);
+	writel_relaxed(val, reg);
+
+	ret = readl_poll_timeout_atomic(reg, val,
+					!(val & APPLE_CLKGEN_PSTATE_BUSY), 1,
+					APPLE_CLKGEN_PSTATE_TIMEOUT_US);
+	if (ret)
+		dev_err(misc->dev, "%s pstate %u timed out: 0x%08x\n",
+			step->dev == DEV_FABRIC ? "fabric" : "dcs", pstate, val);
+
+	return ret;
+}
+
+static int apple_pmgr_sys_dev_run(struct apple_pmgr_misc *misc,
+				  const struct apple_pmgr_pstate_step *steps,
+				  unsigned int n)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < n; i++) {
+		ret = apple_pmgr_sys_dev_step(misc, &steps[i]);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static bool apple_pmgr_misc_can_stage(struct apple_pmgr_misc *misc)
+{
+	return misc->hw && misc->devices[DEV_FABRIC].base &&
+	       misc->devices[DEV_DCS].base;
+}
+
+static int apple_pmgr_misc_staged_resume(struct apple_pmgr_misc *misc)
+{
+	return apple_pmgr_sys_dev_run(misc, misc->hw->resume,
+				      misc->hw->n_resume);
+}
+
+static int apple_pmgr_misc_staged_suspend(struct apple_pmgr_misc *misc)
+{
+	int ret;
+
+	ret = apple_pmgr_sys_dev_run(misc, misc->hw->suspend,
+				     misc->hw->n_suspend);
+	if (ret) {
+		/* The resume callback is not called after a failed suspend */
+		misc->staged = false;
+		apple_pmgr_misc_staged_resume(misc);
+	}
+
+	return ret;
+}
+
 static int __maybe_unused apple_pmgr_misc_suspend_noirq(struct device *dev)
 {
 	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
 	int i;
+
+	misc->staged = staged_pstate && apple_pmgr_misc_can_stage(misc);
+	if (misc->staged)
+		return apple_pmgr_misc_staged_suspend(misc);
 
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, false);
@@ -72,6 +176,12 @@ static int __maybe_unused apple_pmgr_misc_resume_noirq(struct device *dev)
 {
 	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
 	int i;
+
+	if (misc->staged) {
+		misc->staged = false;
+		apple_pmgr_misc_staged_resume(misc);
+		return 0;
+	}
 
 	for (i = 0; i < DEV_MAX; i++)
 		apple_pmgr_sys_dev_set_pstate(misc, i, true);
@@ -118,6 +228,7 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	misc->dev = dev;
+	misc->hw = of_device_get_match_data(dev);
 
 	if (apple_pmgr_init_device(misc, DEV_FABRIC, "fabric"))
 		ret = 0;
@@ -130,7 +241,34 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 	return ret;
 }
 
+/*
+ * t602x: step fabric and DCS down together (FAB 5, DCS 7, FAB 3, DCS 5) and
+ * bring them back up the same way (FAB 5, DCS 7) before returning to the
+ * pstates found at probe.
+ */
+static const struct apple_pmgr_pstate_step t6020_suspend_steps[] = {
+	{ DEV_FABRIC, 5 },
+	{ DEV_DCS, 7 },
+	{ DEV_FABRIC, 3 },
+	{ DEV_DCS, 5 },
+};
+
+static const struct apple_pmgr_pstate_step t6020_resume_steps[] = {
+	{ DEV_FABRIC, 5 },
+	{ DEV_DCS, 7 },
+	{ DEV_DCS, SYS_DEV_PSTATE_BOOT },
+	{ DEV_FABRIC, SYS_DEV_PSTATE_BOOT },
+};
+
+static const struct apple_pmgr_misc_hw t6020_pmgr_misc_hw = {
+	.suspend = t6020_suspend_steps,
+	.n_suspend = ARRAY_SIZE(t6020_suspend_steps),
+	.resume = t6020_resume_steps,
+	.n_resume = ARRAY_SIZE(t6020_resume_steps),
+};
+
 static const struct of_device_id apple_pmgr_misc_of_match[] = {
+	{ .compatible = "apple,t6020-pmgr-misc", .data = &t6020_pmgr_misc_hw },
 	{ .compatible = "apple,t6000-pmgr-misc" },
 	{}
 };
