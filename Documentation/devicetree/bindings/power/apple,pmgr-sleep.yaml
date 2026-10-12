@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/apple,pmgr-sleep.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SoC PMGR system sleep controls
+
+maintainers:
+  - RJ Skerry-Ryan <rryan@alum.mit.edu>
+
+description: |
+  The Apple PMGR counts entries into, and time spent in, each SoC sleep
+  state (DDR self-refresh, suspend-to-RAM, deep wait, ...), records how long
+  the SoC took to leave its last sleep and latches the sources that woke the
+  application processors. It also has controls, outside the individual
+  device power states, that take further parts of the SoC down during
+  system sleep: the non-CPU SoC clusters, the CPM power domain gating and
+  the auto-enable behaviour of the SIO power states.
+
+  This node collects those registers. Registers that live inside a PMGR
+  syscon are referenced through phandles rather than mapped again.
+
+properties:
+  $nodename:
+    pattern: "^power-management@[0-9a-f]+$"
+
+  compatible:
+    const: apple,t6020-pmgr-sleep
+
+  reg:
+    minItems: 1
+    items:
+      - description: PMGR sleep-state event counters
+      - description: always-on GPU fabric configuration
+      - description: CPM control and power domain gating
+      - description: AP wake source masks and latched wake sources
+      - description: PMGR counters holding the sleep exit times
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: events
+      - const: aon-gfx
+      - const: cpm
+      - const: wake
+      - const: wake-time
+
+  apple,pmgr:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: PMGR syscon holding the SoC cluster power controls
+
+  apple,soc-clusters:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 8
+    description:
+      Physical IDs of the non-CPU SoC clusters that may be powered down
+      during system sleep, in power-down order. They are powered back up in
+      the reverse order.
+
+  apple,sio-domains:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 1
+    maxItems: 4
+    items:
+      maxItems: 1
+    description:
+      SIO power state nodes whose auto-enable is cleared during system sleep
+
+  apple,afr-domain:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Media fabric (AFR) power state node
+
+  apple,afr-dependents:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 1
+    maxItems: 8
+    items:
+      maxItems: 1
+    description:
+      Power state nodes behind the AFR; the AFR is only turned off when all
+      of these are powered down
+
+  apple,ap-wake-sources:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 263
+    items:
+      maximum: 262
+    description:
+      Bit numbers of the AP wake sources allowed to wake the application
+      processors from suspend-to-RAM. Every other source is masked while
+      the SoC is in suspend-to-RAM.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+
+dependentRequired:
+  apple,soc-clusters: [ "apple,pmgr" ]
+  apple,afr-dependents: [ "apple,afr-domain" ]
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        power-management@29e2c8000 {
+            compatible = "apple,t6020-pmgr-sleep";
+            reg = <0x2 0x9e2c8000 0x0 0x1000>,
+                  <0x2 0x9e2cd010 0x0 0x4>,
+                  <0x2 0x8e08c000 0x0 0x40>,
+                  <0x2 0x9e004000 0x0 0x60>,
+                  <0x2 0x8e0e0000 0x0 0x1000>;
+            reg-names = "events", "aon-gfx", "cpm", "wake", "wake-time";
+            apple,pmgr = <&pmgr>;
+            apple,soc-clusters = <3 5 4 6>;
+            apple,sio-domains = <&ps_sio>, <&ps_sio_cpu>;
+            apple,afr-domain = <&ps_afr>;
+            apple,afr-dependents = <&ps_gfx>, <&ps_dispext0_sys>;
+            apple,ap-wake-sources = <12 14 26 27 40 43 49 50 51 52 54 85 90
+                                     126 127 128 129 130 131 132 133 223>;
+        };
+    };
