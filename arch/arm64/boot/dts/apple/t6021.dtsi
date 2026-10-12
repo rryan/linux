@@ -91,6 +91,24 @@
 		reg-names = "cpu-start", "acc0", "acc1", "acc2";
 		apple,pmgr = <&pmgr>;
 	};
+
+	/*
+	 * Final suspend-to-RAM sequence on the boot CPU. Only offered with
+	 * apple_s2r.enable=1 and boot firmware that advertises a warm boot
+	 * mailbox in /chosen/asahi,s2r-mailbox.
+	 */
+	pmgr_s2r: power-management@28e038000 {
+		compatible = "apple,t6021-pmgr-s2r";
+		reg = <0x2 0x8e038000 0x0 0x1000>,
+			<0x2 0x8e224000 0x0 0x4>,
+			<0x2 0x9e5c4000 0x0 0x4>;
+		reg-names = "clkgen", "pll", "s2r-timer";
+		apple,pmgr = <&pmgr>;
+		/* Physical SoC cluster IDs: ECPU, PCPU0, PCPU1 */
+		apple,cpu-clusters = <0 1 2>;
+		apple,sep-domain = <&ps_sep>;
+		apple,watchdog = <&wdt>;
+	};
 };
 
 &cpu_e01 {
