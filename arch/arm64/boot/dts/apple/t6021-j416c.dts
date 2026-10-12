@@ -51,6 +51,11 @@
 	apple,l1ss-ctl = <0x4055190f 0x00000000>;
 };
 
+&port01 {
+	/* SD card reader supply is switched off during system sleep */
+	apple,pwren-off-in-suspend;
+};
+
 &panel {
 	compatible = "apple,panel-j416", "apple,panel-mini-led", "apple,panel";
 	width-mm = <346>;

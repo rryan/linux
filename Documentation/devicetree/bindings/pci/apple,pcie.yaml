@@ -142,6 +142,12 @@ patternProperties:
         description: Optional GPIO to power on the device
         maxItems: 1
 
+      apple,pwren-off-in-suspend:
+        type: boolean
+        description:
+          Switch the supply controlled by pwren-gpios off while the port is
+          powered down for system sleep. Without it the supply stays on.
+
       apple,l1ss-ctl:
         $ref: /schemas/types.yaml#/definitions/uint32-array
         items:

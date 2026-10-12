@@ -356,6 +356,7 @@ struct apple_pcie_port {
 	struct gpio_desc	*pwren;
 	u32			l1ss_ctl[2];
 	bool			has_l1ss;
+	bool			pwren_off_suspend;
 	bool			powered_down;
 	u32			saved_pmeto;
 };
@@ -1647,6 +1648,8 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		port->has_l1ss = !of_property_read_u32_array(np, "apple,l1ss-ctl",
 							     port->l1ss_ctl,
 							     ARRAY_SIZE(port->l1ss_ctl));
+		port->pwren_off_suspend =
+			of_property_read_bool(np, "apple,pwren-off-in-suspend");
 	}
 
 	if (!pcie->hw->retain_clocks) {
@@ -3236,7 +3239,7 @@ static u32 apple_pcie_port_ltssm(struct apple_pcie_port *port)
  * Take an internal port's link down to L2 and power the port down for
  * system sleep: PME_Turn_Off, wait for PME_TO_Ack and L2, assert PERST#,
  * drop the PHY lane reference clock requests and disable the port. The
- * endpoint supply stays on.
+ * endpoint supply stays on unless the board marks it to be switched off.
  *
  * A port with a function armed for wakeup keeps its link, so that the
  * function can still signal PME.
@@ -3327,6 +3330,12 @@ static void apple_pcie_port_power_down(struct apple_pcie_port *port)
 	}
 	apple_pcie_core_appclk_gating(pcie, true);
 
+	if (port->pwren && port->pwren_off_suspend) {
+		gpiod_set_value_cansleep(port->pwren, 0);
+		/* Let the supply discharge fully. */
+		msleep(250);
+	}
+
 	port->powered_down = true;
 	apple_pcie_mark_power_lost(root, NULL);
 	pci_walk_bus(root->subordinate, apple_pcie_mark_power_lost, NULL);
@@ -3345,7 +3354,7 @@ static int apple_pcie_port_power_restore(struct apple_pcie_port *port)
 
 	apple_pcie_core_appclk_gating(pcie, false);
 	rmw_clear(PHY_LANE_CFG_T602X_UNK14, port->phy + PHY_LANE_CFG);
-	ret = apple_pcie_port_power_up(pcie, port, false);
+	ret = apple_pcie_port_power_up(pcie, port, port->pwren_off_suspend);
 	apple_pcie_core_appclk_gating(pcie, true);
 	if (ret)
 		return ret;
