@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/apple,pmgr-s2r.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SoC suspend-to-RAM controls
+
+maintainers:
+  - RJ Skerry-Ryan <rryan@alum.mit.edu>
+
+description: |
+  Entering suspend-to-RAM on Apple SoCs takes, once every device and every
+  secondary CPU is down, a final PMGR sequence on the boot CPU: power down
+  the CPU clusters, switch the SoC clock generators off their PLL, put the
+  PLL into its off mode and start the PMGR suspend-to-RAM timer. The boot
+  CPU then enters a non-retention WFI and the SoC goes to sleep. On wake
+  the boot CPU restarts at its reset vector and the SEP power state has to
+  be forced back on.
+
+  This node describes the registers for that sequence that are not part of
+  a PMGR syscon, and references the rest by phandle.
+
+  Resuming needs boot firmware that hands the boot CPU's reset vector back
+  to the kernel. Such firmware advertises a warm boot mailbox in the
+  64-bit /chosen/asahi,s2r-mailbox property: the physical address of four
+  little-endian u64 words, magic (0x21523253316e316d arms the warm boot
+  path; firmware clears it once taken), entry (physical address to branch
+  to at EL2 with the MMU off), arg (passed in x0) and flags (bit 0: keep
+  the firmware console quiet on CPU reset entries; bit 1: redo CPU cluster
+  frequency init; bit 2: redo memory cache controller init; bit 63: set by
+  firmware when it took the warm boot path). The region is reserved
+  memory. Without the property, suspend-to-RAM is not offered.
+
+properties:
+  $nodename:
+    pattern: "^power-management@[0-9a-f]+$"
+
+  compatible:
+    const: apple,t6021-pmgr-s2r
+
+  reg:
+    items:
+      - description: SoC clock generator
+      - description: SoC PLL off-mode control
+      - description: PMGR suspend-to-RAM timer
+
+  reg-names:
+    items:
+      - const: clkgen
+      - const: pll
+      - const: s2r-timer
+
+  apple,pmgr:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: PMGR syscon holding the SoC cluster power controls
+
+  apple,cpu-clusters:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 8
+    description:
+      Physical SoC cluster IDs of the CPU clusters, in power-down order
+
+  apple,sep-domain:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: SEP power state node, forced back on after wake
+
+  apple,watchdog:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      System watchdog. For bring-up it can be armed right before the SoC
+      goes to sleep, so that a suspend-to-RAM that never resumes ends in a
+      reset. Its registers stay owned by the watchdog's own node.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - apple,pmgr
+  - apple,cpu-clusters
+  - apple,sep-domain
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        power-management@28e038000 {
+            compatible = "apple,t6021-pmgr-s2r";
+            reg = <0x2 0x8e038000 0x0 0x1000>,
+                  <0x2 0x8e224000 0x0 0x4>,
+                  <0x2 0x9e5c4000 0x0 0x4>;
+            reg-names = "clkgen", "pll", "s2r-timer";
+            apple,pmgr = <&pmgr>;
+            apple,cpu-clusters = <0 1 2>;
+            apple,sep-domain = <&ps_sep>;
+            apple,watchdog = <&wdt>;
+        };
+    };
