@@ -9,6 +9,7 @@ apple-mailbox-y = mailbox.o
 obj-$(CONFIG_APPLE_PMGR_MISC)	+= apple-pmgr-misc.o
 
 obj-$(CONFIG_APPLE_SLEEP)	+= apple-sleep.o
+obj-$(CONFIG_APPLE_S2R)		+= apple-s2r.o
 
 obj-$(CONFIG_APPLE_RTKIT) += apple-rtkit.o
 apple-rtkit-y = rtkit.o rtkit-crashlog.o

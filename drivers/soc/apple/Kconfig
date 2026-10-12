@@ -45,6 +45,22 @@ config APPLE_SLEEP
 	  during suspend-to-idle; those steps are off unless enabled
 	  with the apple_sleep.stages parameter.
 
+config APPLE_S2R
+	bool "Apple SoC suspend-to-RAM"
+	depends on ARM64 && SUSPEND && OF
+	depends on ARM64_APPLE_CPU_HOTPLUG
+	depends on APPLE_SLEEP
+	select MFD_SYSCON
+	default ARCH_APPLE
+	help
+	  Offers the "deep" mem sleep state on Apple SoCs whose boot
+	  firmware can hand the boot CPU's reset vector back to the
+	  kernel on wake. Takes the SoC into suspend-to-RAM once all
+	  devices and secondary CPUs are down, and restores it on wake.
+
+	  Off unless enabled with apple_s2r.enable=1 on the kernel
+	  command line.
+
 config APPLE_RTKIT
 	tristate "Apple RTKit co-processor IPC protocol"
 	depends on APPLE_MAILBOX
