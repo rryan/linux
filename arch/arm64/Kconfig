@@ -1560,6 +1560,22 @@ config HOTPLUG_CPU
 	  Say Y here to experiment with turning CPUs off and on.  CPUs
 	  can be controlled through /sys/devices/system/cpu.
 
+config ARM64_APPLE_CPU_HOTPLUG
+	bool "CPU hotplug for Apple SoCs"
+	depends on ARCH_APPLE && HOTPLUG_CPU
+	default ARCH_APPLE
+	select KEXEC_CORE
+	help
+	  Lets spin-table secondary CPUs of Apple SoCs go offline, on systems
+	  whose device tree describes their PMGR CPU controls. An offline CPU
+	  parks in the kernel at a power-down WFI with state retention and
+	  comes back through the kernel's holding pen, entered with the MMU
+	  off through the kexec soft restart code.
+
+	  Across suspend to RAM, offline CPUs power down through the PMGR
+	  CPU stop control and are started again through the boot loader's
+	  resident secondary entry path, which jumps back to the holding pen.
+
 # Common NUMA Features
 config NUMA
 	bool "NUMA Memory Allocation and Scheduler Support"

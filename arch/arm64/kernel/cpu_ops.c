@@ -14,7 +14,8 @@
 #include <asm/cpu_ops.h>
 #include <asm/smp_plat.h>
 
-extern const struct cpu_operations smp_spin_table_ops;
+#include "smp_spin_table.h"
+
 #ifdef CONFIG_ARM64_ACPI_PARKING_PROTOCOL
 extern const struct cpu_operations acpi_parking_protocol_ops;
 #endif
@@ -108,6 +109,9 @@ int __init init_cpu_ops(int cpu)
 		pr_warn("Unsupported enable-method: %s\n", enable_method);
 		return -EOPNOTSUPP;
 	}
+
+	if (cpu_ops[cpu] == &smp_spin_table_ops && apple_spin_table_probe(cpu))
+		cpu_ops[cpu] = &apple_spin_table_ops;
 
 	return 0;
 }

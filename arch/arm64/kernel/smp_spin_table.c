@@ -18,7 +18,8 @@
 #include <asm/io.h>
 #include <asm/smp_plat.h>
 
-extern void secondary_holding_pen(void);
+#include "smp_spin_table.h"
+
 volatile unsigned long __section(".mmuoff.data.read")
 secondary_holding_pen_release = INVALID_HWID;
 
@@ -30,7 +31,7 @@ static phys_addr_t cpu_release_addr[NR_CPUS];
  * in coherency or not.  This is necessary for the hotplug code to work
  * reliably.
  */
-static void write_pen_release(u64 val)
+void smp_spin_table_write_pen_release(u64 val)
 {
 	void *start = (void *)&secondary_holding_pen_release;
 	unsigned long size = sizeof(secondary_holding_pen_release);
@@ -40,7 +41,7 @@ static void write_pen_release(u64 val)
 }
 
 
-static int smp_spin_table_cpu_init(unsigned int cpu)
+int smp_spin_table_cpu_init(unsigned int cpu)
 {
 	struct device_node *dn;
 	int ret;
@@ -63,7 +64,7 @@ static int smp_spin_table_cpu_init(unsigned int cpu)
 	return ret;
 }
 
-static int smp_spin_table_cpu_prepare(unsigned int cpu)
+int smp_spin_table_cpu_prepare(unsigned int cpu)
 {
 	__le64 __iomem *release_addr;
 	phys_addr_t pa_holding_pen = __pa_symbol(secondary_holding_pen);
@@ -104,12 +105,12 @@ static int smp_spin_table_cpu_prepare(unsigned int cpu)
 	return 0;
 }
 
-static int smp_spin_table_cpu_boot(unsigned int cpu)
+int smp_spin_table_cpu_boot(unsigned int cpu)
 {
 	/*
 	 * Update the pen release flag.
 	 */
-	write_pen_release(cpu_logical_map(cpu));
+	smp_spin_table_write_pen_release(cpu_logical_map(cpu));
 
 	/*
 	 * Send an event, causing the secondaries to read pen_release.
