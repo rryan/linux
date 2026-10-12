@@ -16,6 +16,7 @@
 #include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/printk.h>
+#include <linux/wait.h>
 
 #include <linux/unaligned.h>
 
@@ -36,6 +37,14 @@ enum bcm4377_chip {
 
 #define BCM4377_TIMEOUT msecs_to_jiffies(1000)
 #define BCM4377_BOOT_TIMEOUT msecs_to_jiffies(5000)
+
+/*
+ * Time the firmware gets to report that it entered host sleep, and to report
+ * that it is awake again after the host left host sleep or asked it to leave
+ * peripheral sleep.
+ */
+#define BCM4377_HOST_SLEEP_TIMEOUT usecs_to_jiffies(25000)
+#define BCM4377_WAKE_TIMEOUT	   usecs_to_jiffies(50000)
 
 /*
  * These devices only support DMA transactions inside a 32bit window
@@ -61,10 +70,18 @@ enum bcm4377_chip {
 #define BCM4377_BAR0_FW_DOORBELL 0x140
 #define BCM4377_BAR0_RTI_CONTROL 0x144
 
-#define BCM4377_BAR0_SLEEP_CONTROL	      0x150
-#define BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE  0
-#define BCM4377_BAR0_SLEEP_CONTROL_AWAKE      2
-#define BCM4377_BAR0_SLEEP_CONTROL_QUIESCE    3
+/*
+ * The host requests a sleep state by writing it to SLEEP_CONTROL, and the
+ * firmware reports its own sleep state in the peripheral info buffer.
+ */
+#define BCM4377_BAR0_SLEEP_CONTROL 0x150
+
+enum bcm4377_sleep_state {
+	BCM4377_SLEEP_ACTIVE = 0,
+	BCM4377_SLEEP_PERIPHERAL_SLEEP = 1,
+	BCM4377_SLEEP_PERIPHERAL_WAKE = 2,
+	BCM4377_SLEEP_HOST_SLEEP = 3,
+};
 
 #define BCM4377_BAR0_DOORBELL	    0x174
 #define BCM4377_BAR0_DOORBELL_VALUE GENMASK(31, 16)
@@ -300,8 +317,8 @@ static_assert(sizeof(struct bcm4377_destroy_transfer_ring_msg) ==
  * version: Protocol version, must be 2.
  * size: Size of this structure, must be 0x68.
  * enabled_caps: Enabled capabilities. Unknown bitfield but should be 2.
- * peripheral_info_addr: DMA address for a 0x20 buffer to which the device will
- *                       write unknown contents
+ * peripheral_info_addr: DMA address for a struct bcm4377_peripheral_info
+ *                       buffer that the device writes its state to
  * {completion,xfer}_ring_{tails,heads}_addr: DMA pointers to ring heads/tails
  * n_completion_rings: Number of completion rings, the firmware only works if
  *                     this is set to BCM4377_N_COMPLETION_RINGS.
@@ -365,6 +382,23 @@ struct bcm4377_context {
 	__le32 _unk3;
 } __packed;
 static_assert(sizeof(struct bcm4377_context) == 0x68);
+
+/*
+ * Buffer the device writes its state to. A change raises an interrupt.
+ *
+ * bootstage: Same as the BOOTSTAGE register
+ * rti_status: Same as the RTI_STATUS register
+ * sleep_state: Sleep state of the firmware, enum bcm4377_sleep_state
+ * image_size: Same as the firmware image size register
+ */
+struct bcm4377_peripheral_info {
+	__le32 bootstage;
+	__le32 rti_status;
+	__le32 sleep_state;
+	__le32 image_size;
+	u8 _unk[0x10];
+} __packed;
+static_assert(sizeof(struct bcm4377_peripheral_info) == 0x20);
 
 #define BCM4378_CALIBRATION_CHUNK_SIZE 0xe6
 struct bcm4378_hci_send_calibration_cmd {
@@ -553,6 +587,11 @@ static const struct dmi_system_id bcm4377_dmi_board_table[];
  * event: Event for changed bootstage or rti_status; used for booting firmware
  * ctx: "Converged IPC" context
  * ctx_dma: "Converged IPC" context DMA address
+ * peripheral_info: Buffer the device writes its state to
+ * sleep_state: Last sleep state seen in peripheral_info
+ * sleep_wq: Woken up when the device reports a new sleep state
+ * host_sleep: Host sleep has been requested and not yet left; no messages
+ *             may be sent
  * ring_state: Shared memory buffer containing ring head and tail indexes
  * ring_state_dma: DMA address for ring_state
  * {control,hci_acl,sco}_ack_ring: Completion rings used to acknowledge messages
@@ -588,12 +627,13 @@ struct bcm4377_data {
 	/* Set once a recovery reprobe has been queued for this binding. */
 	unsigned long reset_pending;
 
-	/* System sleep: firmware quiesced, or kept running to wake us. */
-	bool quiesced;
-	bool wake_armed;
-
 	struct bcm4377_context *ctx;
 	dma_addr_t ctx_dma;
+
+	struct bcm4377_peripheral_info *peripheral_info;
+	u32 sleep_state;
+	wait_queue_head_t sleep_wq;
+	bool host_sleep;
 
 	struct bcm4377_ring_state *ring_state;
 	dma_addr_t ring_state_dma;
@@ -845,7 +885,7 @@ static void bcm4377_poll_completion_ring(struct bcm4377_data *bcm4377,
 static irqreturn_t bcm4377_irq(int irq, void *data)
 {
 	struct bcm4377_data *bcm4377 = data;
-	u32 bootstage, rti_status;
+	u32 bootstage, rti_status, sleep_state;
 
 	bootstage = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_BOOTSTAGE);
 	rti_status = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_RTI_STATUS);
@@ -863,6 +903,14 @@ static irqreturn_t bcm4377_irq(int irq, void *data)
 
 	if (rti_status > 2)
 		dev_err(&bcm4377->pdev->dev, "RTI status is %d\n", rti_status);
+
+	sleep_state = le32_to_cpu(READ_ONCE(bcm4377->peripheral_info->sleep_state));
+	if (sleep_state != bcm4377->sleep_state) {
+		dev_dbg(&bcm4377->pdev->dev, "sleep state = %d -> %d\n",
+			bcm4377->sleep_state, sleep_state);
+		bcm4377->sleep_state = sleep_state;
+		wake_up(&bcm4377->sleep_wq);
+	}
 
 	bcm4377_poll_completion_ring(bcm4377, &bcm4377->control_ack_ring);
 	bcm4377_poll_completion_ring(bcm4377, &bcm4377->hci_acl_event_ring);
@@ -898,6 +946,13 @@ static int bcm4377_enqueue(struct bcm4377_data *bcm4377,
 		return -EINVAL;
 	if (ring->virtual)
 		return -EINVAL;
+
+	/*
+	 * No messages may be sent while the firmware is in host sleep, or on
+	 * its way in or out of it. Sending one would also write SLEEP_CONTROL.
+	 */
+	if (READ_ONCE(bcm4377->host_sleep))
+		return -EBUSY;
 
 	spin_lock_irqsave(&ring->lock, flags);
 
@@ -952,7 +1007,7 @@ static int bcm4377_enqueue(struct bcm4377_data *bcm4377,
 	 * have been idle for a while. Poking the sleep control register here
 	 * makes them come alive again.
 	 */
-	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_AWAKE,
+	iowrite32(BCM4377_SLEEP_PERIPHERAL_WAKE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
 
 	dev_dbg(&bcm4377->pdev->dev,
@@ -1628,13 +1683,11 @@ static int bcm4377_init_context(struct bcm4377_data *bcm4377)
 	bcm4377->ctx->size = cpu_to_le16(sizeof(*bcm4377->ctx));
 	bcm4377->ctx->enabled_caps = cpu_to_le32(2);
 
-	/*
-	 * The BT device will write 0x20 bytes of data to this buffer but
-	 * the exact contents are unknown. It only needs to exist for BT
-	 * to work such that we can just allocate and then ignore it.
-	 */
-	if (!dmam_alloc_coherent(&bcm4377->pdev->dev, 0x20,
-				 &peripheral_info_dma, GFP_KERNEL))
+	/* The BT device reports its boot, RTI and sleep state here. */
+	bcm4377->peripheral_info =
+		dmam_alloc_coherent(dev, sizeof(*bcm4377->peripheral_info),
+				    &peripheral_info_dma, GFP_KERNEL);
+	if (!bcm4377->peripheral_info)
 		return -ENOMEM;
 	bcm4377->ctx->peripheral_info_addr = cpu_to_le64(peripheral_info_dma);
 
@@ -2355,6 +2408,7 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	bcm4377->pdev = pdev;
 	bcm4377->hw = &bcm4377_hw_variants[id->driver_data];
 	init_completion(&bcm4377->event);
+	init_waitqueue_head(&bcm4377->sleep_wq);
 
 	ret = bcm4377_prepare_rings(bcm4377);
 	if (ret)
@@ -2485,6 +2539,33 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 					hdev);
 }
 
+static u32 bcm4377_sleep_state(struct bcm4377_data *bcm4377)
+{
+	return le32_to_cpu(READ_ONCE(bcm4377->peripheral_info->sleep_state));
+}
+
+static bool bcm4377_awake(struct bcm4377_data *bcm4377)
+{
+	u32 state = bcm4377_sleep_state(bcm4377);
+
+	return state == BCM4377_SLEEP_ACTIVE ||
+	       state == BCM4377_SLEEP_PERIPHERAL_SLEEP;
+}
+
+static void bcm4377_set_sleep_control(struct bcm4377_data *bcm4377,
+				      enum bcm4377_sleep_state state)
+{
+	iowrite32(state, bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+	/* Flush the posted write. */
+	ioread32(bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+}
+
+/*
+ * System sleep: the firmware is put into host sleep, and bus mastering is
+ * disabled once it reports that it is there. The rings stay set up. The PCI
+ * core then saves the config space and puts the function into D3hot, arming
+ * PME when wakeup is enabled.
+ */
 static int bcm4377_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
@@ -2496,23 +2577,30 @@ static int bcm4377_suspend(struct device *dev)
 	if (ret)
 		return ret;
 
-	if (device_may_wakeup(dev)) {
-		/*
-		 * Remote wakeup: leave the firmware running and the function
-		 * in D0, so a connection attempt from a wake-allowed device
-		 * raises an interrupt. Saving the state here stops the PCI
-		 * core from putting the function into D3hot.
-		 */
-		pci_save_state(pdev);
-		bcm4377->wake_armed = !enable_irq_wake(pdev->irq);
-		return 0;
+	WRITE_ONCE(bcm4377->host_sleep, true);
+
+	/* Host sleep can only be entered from the active state. */
+	if (bcm4377_sleep_state(bcm4377) == BCM4377_SLEEP_PERIPHERAL_SLEEP) {
+		bcm4377_set_sleep_control(bcm4377,
+					  BCM4377_SLEEP_PERIPHERAL_WAKE);
+		if (wait_event_timeout(bcm4377->sleep_wq,
+				       bcm4377_sleep_state(bcm4377) ==
+					       BCM4377_SLEEP_ACTIVE,
+				       BCM4377_WAKE_TIMEOUT))
+			bcm4377_set_sleep_control(bcm4377,
+						  BCM4377_SLEEP_ACTIVE);
+		else
+			dev_warn(dev, "firmware did not leave peripheral sleep\n");
 	}
 
-	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_QUIESCE,
-		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
-	/* Flush the posted write before the system goes to sleep. */
-	ioread32(bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
-	bcm4377->quiesced = true;
+	bcm4377_set_sleep_control(bcm4377, BCM4377_SLEEP_HOST_SLEEP);
+	if (!wait_event_timeout(bcm4377->sleep_wq,
+				bcm4377_sleep_state(bcm4377) ==
+					BCM4377_SLEEP_HOST_SLEEP,
+				BCM4377_HOST_SLEEP_TIMEOUT))
+		dev_warn(dev, "firmware did not enter host sleep\n");
+
+	pci_clear_master(pdev);
 
 	return 0;
 }
@@ -2521,19 +2609,26 @@ static int bcm4377_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
+	int ret;
 
-	if (bcm4377->wake_armed) {
-		disable_irq_wake(pdev->irq);
-		bcm4377->wake_armed = false;
-	}
+	/*
+	 * The BAR windows are not part of the saved config space. Program
+	 * them again in case the function was reset while the system slept.
+	 */
+	ret = bcm4377_init_cfg(bcm4377);
+	if (ret)
+		dev_err(dev, "setting up the BAR windows failed with %d\n",
+			pcibios_err_to_errno(ret));
 
-	if (bcm4377->quiesced) {
-		iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
-			  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
-		/* The firmware must see UNQUIESCE before the resume commands. */
-		ioread32(bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
-		bcm4377->quiesced = false;
-	}
+	/* The state saved during suspend has bus mastering disabled. */
+	pci_set_master(pdev);
+
+	bcm4377_set_sleep_control(bcm4377, BCM4377_SLEEP_ACTIVE);
+	if (!wait_event_timeout(bcm4377->sleep_wq, bcm4377_awake(bcm4377),
+				BCM4377_WAKE_TIMEOUT))
+		dev_warn(dev, "firmware did not leave host sleep\n");
+
+	WRITE_ONCE(bcm4377->host_sleep, false);
 
 	return hci_resume_dev(bcm4377->hdev);
 }
