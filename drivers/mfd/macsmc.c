@@ -6,6 +6,7 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/io.h>
@@ -21,6 +22,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/seq_file.h>
 #include <linux/unaligned.h>
 
 #define SMC_ENDPOINT			0x20
@@ -412,6 +414,36 @@ static void apple_smc_disable_notifications(void *data)
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), false);
 }
 
+/*
+ * Debug: dump every readable, non-function key as "KEY TYPE SIZE HEX", with
+ * key and type as FourCC hex, so userspace can find and sample sensor keys.
+ * Read-only.
+ */
+static int apple_smc_keys_show(struct seq_file *s, void *unused)
+{
+	struct apple_smc *smc = dev_get_drvdata(s->private);
+	struct apple_smc_key_info info;
+	u8 buf[32];
+	smc_key key;
+	u32 i;
+
+	for (i = 0; i < smc->key_count; i++) {
+		if (apple_smc_get_key_by_index(smc, i, &key) < 0)
+			continue;
+		if (apple_smc_get_key_info(smc, key, &info) < 0)
+			continue;
+		if (!(info.flags & APPLE_SMC_READABLE) || (info.flags & APPLE_SMC_FUNCTION) ||
+		    !info.size || info.size > sizeof(buf))
+			continue;
+		if (apple_smc_read(smc, key, buf, info.size) < 0)
+			continue;
+		seq_printf(s, "%08x %08x %u %*phN\n", key, info.type_code, info.size,
+			   info.size, buf);
+	}
+
+	return 0;
+}
+
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -501,6 +533,8 @@ static int apple_smc_probe(struct platform_device *pdev)
 			return dev_err_probe(smc->dev, ret,
 					     "Failed to register the second GPIO bank");
 	}
+
+	debugfs_create_devm_seqfile(dev, "macsmc_keys", NULL, apple_smc_keys_show);
 
 	return 0;
 }
