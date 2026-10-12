@@ -63,6 +63,7 @@ static bool cs42l84_volatile_register(struct device *dev, unsigned int reg)
 {
 	switch (reg) {
 	case CS42L84_DEVID ... CS42L84_DEVID+5:
+	case CS42L84_SOFT_RESET:
 	case CS42L84_TSRS_PLUG_INT_STATUS:
 	case CS42L84_PLL_LOCK_STATUS:
 	case CS42L84_TSRS_PLUG_STATUS:
@@ -1195,6 +1196,133 @@ static void cs42l84_i2c_remove(struct i2c_client *i2c_client)
 	gpiod_set_value_cansleep(cs42l84->reset_gpio, 0);
 }
 
+/* Called with irq_lock held, before the regmap is switched to cache-only. */
+static void cs42l84_power_down_chip(struct cs42l84_private *cs42l84)
+{
+	unsigned int val = 0;
+	int ret;
+
+	/*
+	 * These writes describe the powered-down chip only and must not be
+	 * replayed by the cache sync on resume, so they go straight to the
+	 * hardware.
+	 */
+	regcache_cache_bypass(cs42l84->regmap, true);
+
+	/* The global power down is only safe once VDD_P is latched. */
+	ret = regmap_read(cs42l84->regmap, CS42L84_MIC_DET_CTL4, &val);
+	if (ret || val) {
+		dev_warn(cs42l84->dev,
+			 "VDD_P not latched (%#x), skipping power down\n", val);
+		goto out;
+	}
+
+	regmap_write(cs42l84->regmap, CS42L84_MSM_BLOCK_EN1, 0);
+	/* Best effort: the clamp below is applied even if this times out. */
+	if (regmap_read_poll_timeout(cs42l84->regmap, CS42L84_PLL_LOCK_STATUS,
+				     val, val & CS42L84_PLL_LOCK_STATUS_GLOBAL_PDN,
+				     1000, 50000))
+		dev_warn(cs42l84->dev, "Timed out waiting for global power down\n");
+	regmap_write(cs42l84->regmap, CS42L84_MSM_FILTP_CHARGE_CTL,
+		     CS42L84_MSM_FILTP_CHARGE_CTL_DISCHARGE);
+
+out:
+	regcache_cache_bypass(cs42l84->regmap, false);
+}
+
+static int cs42l84_suspend(struct device *dev)
+{
+	struct cs42l84_private *cs42l84 = dev_get_drvdata(dev);
+	struct i2c_client *i2c_client = to_i2c_client(dev);
+
+	if (i2c_client->irq)
+		disable_irq(i2c_client->irq);
+
+	mutex_lock(&cs42l84->irq_lock);
+	cs42l84_remote_stop(cs42l84);
+	mutex_unlock(&cs42l84->irq_lock);
+	cancel_delayed_work_sync(&cs42l84->remote_poll_work);
+
+	mutex_lock(&cs42l84->irq_lock);
+
+	/* Disable ring sense */
+	cs42l84_set_interrupt_masks(cs42l84, CS42L84_RS_PLUG | CS42L84_RS_UNPLUG);
+	regmap_update_bits(cs42l84->regmap, CS42L84_MSM_BLOCK_EN3,
+			   CS42L84_MSM_BLOCK_EN3_TR_SENSE, 0);
+
+	/* Put the headset path to sleep */
+	cs42l84_revert_hs(cs42l84);
+
+	/*
+	 * The jack may change while the codec is asleep; invalidate the plug
+	 * state so it is evaluated afresh on resume.
+	 */
+	cs42l84->ring_state = CS42L84_UNPLUG;
+
+	/*
+	 * The chip is only powered down when it is also held in reset, since
+	 * resume brings it back through a full reinitialisation.
+	 */
+	if (cs42l84->reset_gpio)
+		cs42l84_power_down_chip(cs42l84);
+
+	mutex_unlock(&cs42l84->irq_lock);
+
+	regcache_cache_only(cs42l84->regmap, true);
+	regcache_mark_dirty(cs42l84->regmap);
+
+	if (cs42l84->reset_gpio) {
+		gpiod_set_value_cansleep(cs42l84->reset_gpio, 0);
+		msleep(1);
+	}
+
+	return 0;
+}
+
+static int cs42l84_resume(struct device *dev)
+{
+	struct cs42l84_private *cs42l84 = dev_get_drvdata(dev);
+	struct i2c_client *i2c_client = to_i2c_client(dev);
+	int ret;
+
+	regcache_cache_only(cs42l84->regmap, false);
+
+	if (cs42l84->reset_gpio) {
+		gpiod_set_value_cansleep(cs42l84->reset_gpio, 1);
+		usleep_range(2000, 3000);
+		regmap_write(cs42l84->regmap, CS42L84_SOFT_RESET,
+			     CS42L84_SOFT_RESET_TRIGGER);
+		usleep_range(500, 1000);
+	}
+
+	ret = regcache_sync(cs42l84->regmap);
+	if (ret) {
+		dev_err(dev, "Failed to restore register cache: %d\n", ret);
+		return ret;
+	}
+
+	mutex_lock(&cs42l84->irq_lock);
+	cs42l84_setup_plug_detect(cs42l84);
+	/* Force the plug handler below to act on the current tip state */
+	cs42l84->tip_state = CS42L84_TRANS;
+	mutex_unlock(&cs42l84->irq_lock);
+
+	/*
+	 * Re-evaluate the jack: this reports either the current plug (running
+	 * headset detection) or an unplug.
+	 */
+	cs42l84_irq_thread(0, cs42l84);
+
+	if (i2c_client->irq)
+		enable_irq(i2c_client->irq);
+
+	return 0;
+}
+
+static const struct dev_pm_ops cs42l84_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(cs42l84_suspend, cs42l84_resume)
+};
+
 static const struct of_device_id cs42l84_of_match[] = {
 	{ .compatible = "cirrus,cs42l84", },
 	{}
@@ -1211,6 +1339,7 @@ static struct i2c_driver cs42l84_i2c_driver = {
 	.driver = {
 		.name = "cs42l84",
 		.of_match_table = cs42l84_of_match,
+		.pm = pm_sleep_ptr(&cs42l84_pm_ops),
 	},
 	.id_table = cs42l84_id,
 	.probe = cs42l84_i2c_probe,
