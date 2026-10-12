@@ -2159,15 +2159,33 @@ EXPORT_SYMBOL_GPL(tipd_remove);
 
 int tipd_suspend(struct tps6598x *tps)
 {
+	int ret;
+
 	if (tps->wakeup) {
 		disable_irq(tps->irq);
 		enable_irq_wake(tps->irq);
-	} else if (tps->reset) {
-		gpiod_set_value_cansleep(tps->reset, 1);
 	}
 
 	if (!tps->irq)
 		cancel_delayed_work_sync(&tps->wq_poll);
+
+	/*
+	 * Tell the controller the host is entering S3 so it can drop into
+	 * its low-power system state. Failure only costs idle power.
+	 */
+	if (tps->data->switch_power_state) {
+		mutex_lock(&tps->lock);
+		ret = tps->data->switch_power_state(tps,
+						    TPS_SYSTEM_POWER_STATE_S3);
+		mutex_unlock(&tps->lock);
+		if (ret)
+			dev_warn(tps->dev,
+				 "failed to enter system power state S3: %d\n",
+				 ret);
+	}
+
+	if (!tps->wakeup && tps->reset)
+		gpiod_set_value_cansleep(tps->reset, 1);
 
 	return 0;
 }
@@ -2176,6 +2194,15 @@ EXPORT_SYMBOL_GPL(tipd_suspend);
 int tipd_resume(struct tps6598x *tps)
 {
 	int ret;
+
+	if (tps->data->switch_power_state) {
+		mutex_lock(&tps->lock);
+		ret = tps->data->switch_power_state(tps,
+						    TPS_SYSTEM_POWER_STATE_S0);
+		mutex_unlock(&tps->lock);
+		if (ret)
+			return ret;
+	}
 
 	ret = tps6598x_check_mode(tps);
 	if (ret < 0)
