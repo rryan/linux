@@ -32,6 +32,22 @@
 		reg-names = "fabric-ps", "dcs-ps";
 	};
 
+	pmgr_sleep: power-management@29e2c8000 {
+		compatible = "apple,t6020-pmgr-sleep";
+		reg = <0x2 0x9e2c8000 0x0 0x1000>,
+			<0x2 0x9e2cd010 0x0 0x4>,
+			<0x2 0x8e08c000 0x0 0x40>,
+			<0x2 0x9e004000 0x0 0x60>,
+			<0x2 0x8e0e0000 0x0 0x1000>;
+		reg-names = "events", "aon-gfx", "cpm", "wake", "wake-time";
+		apple,pmgr = <&pmgr>;
+		/* ANE0, DISPLAY2, DISPLAY, AVE/MSR */
+		apple,soc-clusters = <3 5 4 6>;
+		apple,sio-domains = <&ps_sio>, <&ps_sio_cpu>;
+		apple,afr-domain = <&ps_afr>;
+		apple,afr-dependents = <&ps_gfx>, <&ps_dispext0_sys>;
+	};
+
 	pmp_dart: iommu@28e300000 {
 		compatible = "apple,t6020-dart", "apple,t8110-dart";
 		reg = <0x2 0x8e300000 0x0 0x4000>;
