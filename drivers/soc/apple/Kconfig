@@ -36,11 +36,14 @@ config APPLE_PMGR_MISC
 config APPLE_SLEEP
 	bool "Apple SoC system sleep support"
 	depends on PM_SLEEP && OF
+	select MFD_SYSCON
 	default ARCH_APPLE
 	help
 	  Exposes the Apple PMGR sleep-state event counters in debugfs
 	  and logs how far each one advanced across every system
-	  suspend.
+	  suspend. Optionally powers down further parts of the SoC
+	  during suspend-to-idle; those steps are off unless enabled
+	  with the apple_sleep.stages parameter.
 
 config APPLE_RTKIT
 	tristate "Apple RTKit co-processor IPC protocol"
