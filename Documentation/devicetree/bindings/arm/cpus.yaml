@@ -383,6 +383,23 @@ properties:
     deprecated: true
     description: Use 'mem-supply' instead
 
+  apple,cpu-ctrl:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: phandle to the apple,t6020-cpu-ctrl node
+          - description: cluster index of the CPU
+          - description: core index of the CPU within its cluster
+    description:
+      PMGR controls used to stop and restart this spin-table CPU, see
+      arm/apple/apple,cpu-ctrl.yaml.
+
+  apple,cpu-impl-reg:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description:
+      Physical address of the CPU's implementation registers, holding its
+      RVBAR and core power status. Required with apple,cpu-ctrl.
+
   fsl,soc-operating-points:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
     description: FSL i.MX6 Soc operation-points when change cpu frequency
