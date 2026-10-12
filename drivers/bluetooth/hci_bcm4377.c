@@ -588,10 +588,6 @@ struct bcm4377_data {
 	/* Set once a recovery reprobe has been queued for this binding. */
 	unsigned long reset_pending;
 
-	/* System sleep: firmware quiesced, or kept running to wake us. */
-	bool quiesced;
-	bool wake_armed;
-
 	struct bcm4377_context *ctx;
 	dma_addr_t ctx_dma;
 
@@ -2485,6 +2481,13 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 					hdev);
 }
 
+/*
+ * System sleep: the firmware is always quiesced and the function stops
+ * mastering the bus before the PCI core saves its state and puts it into
+ * D3hot. With wakeup enabled, the PCI core also arms PME so a wake-allowed
+ * remote device can wake the system through the event filter programmed by
+ * hci_suspend_dev().
+ */
 static int bcm4377_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
@@ -2496,23 +2499,12 @@ static int bcm4377_suspend(struct device *dev)
 	if (ret)
 		return ret;
 
-	if (device_may_wakeup(dev)) {
-		/*
-		 * Remote wakeup: leave the firmware running and the function
-		 * in D0, so a connection attempt from a wake-allowed device
-		 * raises an interrupt. Saving the state here stops the PCI
-		 * core from putting the function into D3hot.
-		 */
-		pci_save_state(pdev);
-		bcm4377->wake_armed = !enable_irq_wake(pdev->irq);
-		return 0;
-	}
-
 	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_QUIESCE,
 		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
-	/* Flush the posted write before the system goes to sleep. */
+	/* The firmware must see QUIESCE before bus mastering is disabled. */
 	ioread32(bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
-	bcm4377->quiesced = true;
+
+	pci_clear_master(pdev);
 
 	return 0;
 }
@@ -2522,18 +2514,13 @@ static int bcm4377_resume(struct device *dev)
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct bcm4377_data *bcm4377 = pci_get_drvdata(pdev);
 
-	if (bcm4377->wake_armed) {
-		disable_irq_wake(pdev->irq);
-		bcm4377->wake_armed = false;
-	}
+	/* The state saved during suspend has bus mastering disabled. */
+	pci_set_master(pdev);
 
-	if (bcm4377->quiesced) {
-		iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
-			  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
-		/* The firmware must see UNQUIESCE before the resume commands. */
-		ioread32(bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
-		bcm4377->quiesced = false;
-	}
+	iowrite32(BCM4377_BAR0_SLEEP_CONTROL_UNQUIESCE,
+		  bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
+	/* The firmware must see UNQUIESCE before the resume commands. */
+	ioread32(bcm4377->bar0 + BCM4377_BAR0_SLEEP_CONTROL);
 
 	return hci_resume_dev(bcm4377->hdev);
 }
