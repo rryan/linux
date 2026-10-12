@@ -1209,6 +1209,14 @@ static void cs42l84_power_down_chip(struct cs42l84_private *cs42l84)
 	 */
 	regcache_cache_bypass(cs42l84->regmap, true);
 
+	/*
+	 * Plug detection runs with LATCH_TO_VP set, which leaves VDD_P
+	 * unlatched. Clear it so that MIC_DET_CTL4 reads zero once VDD_P is
+	 * latched; the cache keeps the plug-detect value for resume.
+	 */
+	regmap_update_bits(cs42l84->regmap, CS42L84_MIC_DET_CTL4,
+			   CS42L84_MIC_DET_CTL4_LATCH_TO_VP, 0);
+
 	/* The global power down is only safe once VDD_P is latched. */
 	ret = regmap_read(cs42l84->regmap, CS42L84_MIC_DET_CTL4, &val);
 	if (ret || val) {
