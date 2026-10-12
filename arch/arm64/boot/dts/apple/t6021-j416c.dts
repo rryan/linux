@@ -46,6 +46,11 @@
 	brcm,board-type = "apple,amami";
 };
 
+&port00 {
+	/* L1.1/L1.2 (ASPM + PCI-PM), Tcm_restore 25 us, LTR L1.2 threshold 85 * 1024 ns */
+	apple,l1ss-ctl = <0x4055190f 0x00000000>;
+};
+
 &panel {
 	compatible = "apple,panel-j416", "apple,panel-mini-led", "apple,panel";
 	width-mm = <346>;

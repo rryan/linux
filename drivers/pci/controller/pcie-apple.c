@@ -325,6 +325,8 @@ struct apple_pcie_port {
 	bool			started;
 	bool			needs_stop;
 	bool			link_failed;
+	u32			l1ss_ctl[2];
+	bool			has_l1ss;
 };
 
 static void rmw_set(u32 set, void __iomem *addr)
@@ -1578,6 +1580,10 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 			if (ret)
 				goto err_teardown;
 		}
+
+		port->has_l1ss = !of_property_read_u32_array(np, "apple,l1ss-ctl",
+							     port->l1ss_ctl,
+							     ARRAY_SIZE(port->l1ss_ctl));
 	}
 
 	if (!pcie->hw->retain_clocks) {
@@ -1806,6 +1812,55 @@ static struct apple_pcie_port *apple_pcie_root_port_port(struct pci_dev *pdev)
 	return NULL;
 }
 
+/*
+ * Program the L1 PM Substates timing this board's port requires and allow
+ * the ASPM core to enable the substates set in the port's L1SS Control 1
+ * value. Common_Mode_Restore_Time is only meaningful in the upstream port.
+ */
+static void apple_pcie_port_enable_l1ss(struct apple_pcie_port *port,
+					struct pci_dev *pdev)
+{
+	struct pci_dev *parent = pdev->bus->self;
+	u32 ctl1 = port->l1ss_ctl[0], ctl2 = port->l1ss_ctl[1];
+	u32 timing = PCI_L1SS_CTL1_LTR_L12_TH_VALUE |
+		     PCI_L1SS_CTL1_LTR_L12_TH_SCALE;
+	u32 pwr_on = PCI_L1SS_CTL2_T_PWR_ON_SCALE |
+		     PCI_L1SS_CTL2_T_PWR_ON_VALUE;
+	int state = PCIE_LINK_STATE_L1;
+
+	if (!port->has_l1ss || PCI_FUNC(pdev->devfn) != 0 || !pdev->l1ss)
+		return;
+	if (!parent || pci_pcie_type(parent) != PCI_EXP_TYPE_ROOT_PORT ||
+	    !parent->l1ss)
+		return;
+
+	/* The substates must be disabled while their timing changes. */
+	if (pci_enable_link_state(pdev, PCIE_LINK_STATE_L1))
+		return;
+
+	pci_clear_and_set_config_dword(parent, parent->l1ss + PCI_L1SS_CTL2,
+				       pwr_on, ctl2 & pwr_on);
+	pci_clear_and_set_config_dword(pdev, pdev->l1ss + PCI_L1SS_CTL2,
+				       pwr_on, ctl2 & pwr_on);
+	pci_clear_and_set_config_dword(parent, parent->l1ss + PCI_L1SS_CTL1,
+				       timing | PCI_L1SS_CTL1_CM_RESTORE_TIME,
+				       ctl1 & (timing |
+					       PCI_L1SS_CTL1_CM_RESTORE_TIME));
+	pci_clear_and_set_config_dword(pdev, pdev->l1ss + PCI_L1SS_CTL1,
+				       timing, ctl1 & timing);
+
+	if (ctl1 & PCI_L1SS_CTL1_ASPM_L1_1)
+		state |= PCIE_LINK_STATE_L1_1;
+	if (ctl1 & PCI_L1SS_CTL1_ASPM_L1_2)
+		state |= PCIE_LINK_STATE_L1_2;
+	if (ctl1 & PCI_L1SS_CTL1_PCIPM_L1_1)
+		state |= PCIE_LINK_STATE_L1_1_PCIPM;
+	if (ctl1 & PCI_L1SS_CTL1_PCIPM_L1_2)
+		state |= PCIE_LINK_STATE_L1_2_PCIPM;
+
+	pci_enable_link_state(pdev, state);
+}
+
 static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
@@ -1883,7 +1938,11 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 
 	mutex_unlock(&port->pcie->lock);
 
-	return idx >= 0 ? 0 : idx;
+	if (idx < 0)
+		return idx;
+
+	apple_pcie_port_enable_l1ss(port, pdev);
+	return 0;
 }
 
 static void apple_pcie_disable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)

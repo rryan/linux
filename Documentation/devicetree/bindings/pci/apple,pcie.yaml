@@ -142,6 +142,21 @@ patternProperties:
         description: Optional GPIO to power on the device
         maxItems: 1
 
+      apple,l1ss-ctl:
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        items:
+          - description:
+              L1 PM Substates Control 1 register value. Its enable bits
+              select the substates allowed on the link; its
+              Common_Mode_Restore_Time is programmed into the root port and
+              its LTR_L1.2_THRESHOLD into both ends of the link.
+          - description:
+              L1 PM Substates Control 2 register value, programmed into both
+              ends of the link.
+        description:
+          L1 PM Substates configuration required by the device on this port.
+          Without it, the substates are left as configured by the PCI core.
+
       interrupt-controller: true
 
       apple,tunable:
