@@ -75,6 +75,79 @@
 	};
 };
 
+/*
+ * PMGR CPU start/stop controls and the CPU complex registers of each
+ * cluster; the cluster power states live in the PMGR. They let secondary
+ * CPUs go offline and come back. The boot CPU has no such description: it
+ * cannot be restarted.
+ */
+&{/soc} {
+	cpu_ctrl: cpu-ctrl@28e0a8000 {
+		compatible = "apple,t6020-cpu-ctrl";
+		reg = <0x2 0x8e0a8000 0x0 0x40>,
+			<0x2 0x10e00000 0x0 0x50000>,
+			<0x2 0x11e00000 0x0 0x50000>,
+			<0x2 0x12e00000 0x0 0x50000>;
+		reg-names = "cpu-start", "acc0", "acc1", "acc2";
+		apple,pmgr = <&pmgr>;
+	};
+};
+
+&cpu_e01 {
+	apple,cpu-ctrl = <&cpu_ctrl 0 1>;
+	apple,cpu-impl-reg = /bits/ 64 <0x210150000>;
+};
+
+&cpu_e02 {
+	apple,cpu-ctrl = <&cpu_ctrl 0 2>;
+	apple,cpu-impl-reg = /bits/ 64 <0x210250000>;
+};
+
+&cpu_e03 {
+	apple,cpu-ctrl = <&cpu_ctrl 0 3>;
+	apple,cpu-impl-reg = /bits/ 64 <0x210350000>;
+};
+
+&cpu_p00 {
+	apple,cpu-ctrl = <&cpu_ctrl 1 0>;
+	apple,cpu-impl-reg = /bits/ 64 <0x211050000>;
+};
+
+&cpu_p01 {
+	apple,cpu-ctrl = <&cpu_ctrl 1 1>;
+	apple,cpu-impl-reg = /bits/ 64 <0x211150000>;
+};
+
+&cpu_p02 {
+	apple,cpu-ctrl = <&cpu_ctrl 1 2>;
+	apple,cpu-impl-reg = /bits/ 64 <0x211250000>;
+};
+
+&cpu_p03 {
+	apple,cpu-ctrl = <&cpu_ctrl 1 3>;
+	apple,cpu-impl-reg = /bits/ 64 <0x211350000>;
+};
+
+&cpu_p10 {
+	apple,cpu-ctrl = <&cpu_ctrl 2 0>;
+	apple,cpu-impl-reg = /bits/ 64 <0x212050000>;
+};
+
+&cpu_p11 {
+	apple,cpu-ctrl = <&cpu_ctrl 2 1>;
+	apple,cpu-impl-reg = /bits/ 64 <0x212150000>;
+};
+
+&cpu_p12 {
+	apple,cpu-ctrl = <&cpu_ctrl 2 2>;
+	apple,cpu-impl-reg = /bits/ 64 <0x212250000>;
+};
+
+&cpu_p13 {
+	apple,cpu-ctrl = <&cpu_ctrl 2 3>;
+	apple,cpu-impl-reg = /bits/ 64 <0x212350000>;
+};
+
 &gpu {
 	compatible = "apple,agx-t6021", "apple,agx-g14x", "apple,agx-g14c", "apple,agx-g14s";
 
