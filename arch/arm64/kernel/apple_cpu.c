@@ -55,13 +55,16 @@
 #include <linux/cpu.h>
 #include <linux/cpufeature.h>
 #include <linux/cpumask.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/export.h>
+#include <linux/gfp.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/ioport.h>
 #include <linux/kexec.h>
+#include <linux/ktime.h>
 #include <linux/log2.h>
 #include <linux/mfd/syscon.h>
 #include <linux/minmax.h>
@@ -72,6 +75,7 @@
 #include <linux/of_address.h>
 #include <linux/printk.h>
 #include <linux/regmap.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/smp.h>
 #include <linux/string.h>
@@ -94,6 +98,11 @@ static bool cluster_gating = true;
 module_param(cluster_gating, bool, 0644);
 MODULE_PARM_DESC(cluster_gating,
 		 "Power gate a CPU cluster once all of its CPUs are offline, if the boot loader allows it (default: on)");
+
+static unsigned int reset_marker;
+module_param(reset_marker, uint, 0644);
+MODULE_PARM_DESC(reset_marker,
+		 "DEBUG: patch the boot loader's reset entry to record that a started CPU reached it (1), and to stop it there (2)");
 
 /* Core power control, see apple_cpu_power_down() and apple_cpu_park() */
 #define SYS_IMP_APL_CYC_OVRD		sys_reg(3, 5, 15, 5, 0)
@@ -296,6 +305,8 @@ struct apple_cpu {
 	u64 park_cmd;
 	/* Set by the core once it is about to park */
 	bool parked;
+	/* DEBUG: reset_marker record, written by the core with its MMU off */
+	u64 *dbg_marker;
 };
 
 #define APPLE_MAX_CPU_CTRLS		4
@@ -1060,6 +1071,644 @@ static void __noreturn apple_cpu_park(struct apple_cpu *ac)
 			     APPLE_CPU_SLEEP_MASK_IRQ);
 }
 
+/*
+ * DEBUG: PMGR power state of each core and CPM (ADT pmgr devices ECPU0_0 to
+ * PCPU1_3, then ECPM, PCPM0 and PCPM1), at the start of the PMGR syscon:
+ * target in [3:0], actual in [7:4]. Neither the PMGR nor this driver write
+ * them to start or stop a core.
+ */
+#define DBG_CORE_PS(cl, core)		(8 * (4 * (cl) + (core)))
+#define DBG_CPM_PS(cl)			(8 * (12 + (cl)))
+
+static unsigned int apple_cpu_dbg_pmgr_read(struct apple_cluster *cl,
+					    unsigned int off)
+{
+	unsigned int val;
+
+	if (!cl->ctrl->pmgr || regmap_read(cl->ctrl->pmgr, off, &val))
+		return ~0U;
+	return val;
+}
+
+static unsigned int apple_cpu_dbg_core_ps(struct apple_cpu *ac)
+{
+	return apple_cpu_dbg_pmgr_read(ac->cluster,
+				       DBG_CORE_PS(ac->cluster->idx, ac->core));
+}
+
+static unsigned int apple_cpu_dbg_cpm_ps(struct apple_cluster *cl)
+{
+	return apple_cpu_dbg_pmgr_read(cl, DBG_CPM_PS(cl->idx));
+}
+
+static unsigned int apple_cpu_dbg_ps(struct apple_cluster *cl)
+{
+	return apple_cpu_dbg_pmgr_read(cl, CLUSTER_PS(cl->ctrl->data, cl->idx));
+}
+
+/*
+ * DEBUG: instrumentation of the PMGR start path, to find where a started
+ * core stops. Only runs when cpu_boot starts a core through the PMGR.
+ *
+ * The resident boot loader is m1n1 v1.6.1 stage 2. Its base P is where the
+ * boot loader was loaded, which moves from boot to boot. P is taken from
+ * this CPU's cpu-release-addr, which points at the target word of its spin
+ * table slot (below), not from RVBAR: RVBAR holds the address in [41:12]
+ * only, with other bits set above it (bits 44, 48, 52 and 56 seen, varying
+ * from boot to boot) that are not address bits. A started core runs
+ * P+0 -> cpu_reset (P+0x8fc), which loads its stack pointer from
+ * _reset_stack (P+0xe28d0) and calls _cpu_reset_c (P+0x2b620). That prints
+ * (unless quiet), re-runs init_cpu() and enters smp_secondary_entry, which
+ * uses spin_table[target_cpu] (spin_table at P+0xe0240, 0x40 bytes per slot,
+ * target_cpu at P+0xe08a0): it writes the slot's mpidr, increments its
+ * flag, and increments it again right before it jumps to the slot's target,
+ * the holding pen.
+ *
+ * Progress markers, none of which need a boot loader change:
+ *  - the core status register (impl + 0x100) shows whether it powered up,
+ *    and the PMGR power state registers of the core and of its cluster's
+ *    CPM are logged next to it;
+ *  - the top of the reset stack is poisoned: overwritten words mean the core
+ *    ran C code, and the return addresses it saved show how far it got;
+ *  - the mpidr and flag words of the spin table slots are poisoned, since
+ *    smp_secondary_entry rewrites them;
+ *  - reset_marker (module parameter, off by default): P+0, the reset entry,
+ *    is patched to store a marker (and the core's MPIDR and CurrentEL) to a
+ *    kernel page and then run the two original entry instructions, so it
+ *    is transparent to the boot loader. Only cores started here reset
+ *    through P while the kernel runs: the boot CPU is never offlined, and
+ *    starts are serialized by CPU hotplug. The original words are put
+ *    back after the watch if the marker shows the core ran the patch; if
+ *    not, the patch is left in place, as the core may still fetch it. The
+ *    marker page is never freed for the same reason. With reset_marker=2
+ *    the stub stops the core right after the marker (b .) instead, so
+ *    that nothing after the reset entry runs; the patch then stays in
+ *    place and the CPU cannot come online.
+ *
+ * The core's external debug window (cpu-impl-reg - 0x40000) is not touched:
+ * reading it takes the whole machine down.
+ */
+#define DBG_M1N1_SIZE			0x110000
+#define DBG_M1N1_CPU_RESET		0x8fc
+#define DBG_M1N1_SPIN_TABLE		0xe0240
+#define DBG_M1N1_SLOT_SIZE		0x40
+#define DBG_M1N1_SLOTS			24
+#define DBG_M1N1_SLOT_MPIDR		0x0
+#define DBG_M1N1_SLOT_FLAG		0x8
+#define DBG_M1N1_SLOT_TARGET		0x10
+#define DBG_M1N1_TARGET_CPU		0xe08a0
+#define DBG_M1N1_RESET_STACK		0xe28d0
+#define DBG_SLOT_POISON			0x5107d0d05107d0d0ULL
+#define DBG_STACK_POISON		0x5afe5afe5afe5afeULL
+#define DBG_STACK_POISON_SIZE		0x400
+#define DBG_MAX_FRAMES			16
+#define DBG_WATCH_US			100000
+#define DBG_MAX_CHANGES			32
+#define DBG_RVBAR_ADDR			GENMASK_ULL(41, 12)
+/* m1n1 v1.6.1 _vectors_start: mov x9, #'0'; b cpu_reset */
+#define DBG_M1N1_ENTRY0			0xd2800609
+#define DBG_M1N1_ENTRY1			0x1400023e
+/* The reset stub must stay inside the first vector entry (0x80 bytes). */
+#define DBG_STUB_WORDS			13
+#define DBG_MARKER_MAGIC		0x5a5a000000000000ULL
+#define DBG_MARKER_WORDS		3
+/* m1n1 v1.6.1 uart.c and dockchannel_uart.c uart_base */
+#define DBG_M1N1_UART_BASE		0xe2d78
+#define DBG_M1N1_DOCKCHANNEL_BASE	0xd8030
+#define DBG_DOCKCHANNEL_UART		0x29e528000ULL
+
+struct apple_cpu_dbg {
+	phys_addr_t base;
+	void *m1n1;
+	unsigned int nr_slots;
+	unsigned int slot[2];
+	u64 saved[2][2];
+	/* Start of the poisoned area below the reset stack top, 0 if none */
+	phys_addr_t stack;
+	/* reset_marker: P+0 is patched, the original words to put back */
+	bool patched;
+	/* reset_marker=2: the stub stops the core after the marker */
+	bool spin;
+	u32 saved_code[DBG_STUB_WORDS];
+};
+
+/*
+ * The reset_marker stub, run by the restarted core at P+0 at its reset
+ * exception level, with the MMU and caches off. Its data accesses are
+ * Device-nGnRnE, so they go to memory directly and must be aligned.
+ *
+ *	movz	x0, #pa[15:0]
+ *	movk	x0, #pa[31:16], lsl #16
+ *	movk	x0, #pa[47:32], lsl #32
+ *	mrs	x1, mpidr_el1
+ *	str	x1, [x0, #8]
+ *	mrs	x1, CurrentEL
+ *	str	x1, [x0, #16]
+ *	movz	x1, #cpu
+ *	movk	x1, #0x5a5a, lsl #48
+ *	str	x1, [x0]
+ *	dsb	sy
+ *	<entry[0]>				mov x9, #'0'
+ *	<entry[1], re-targeted>			b cpu_reset
+ *
+ * With @spin, the last two are both "b ." instead.
+ *
+ * x0 and x1 are UNKNOWN out of reset, so the boot loader cannot depend on
+ * them. entry[1] must be a B; its target is kept.
+ */
+#define DBG_A64_MOVZ_X(rd, imm, hw)	(0xd2800000 | (hw) << 21 | \
+					 ((imm) & 0xffff) << 5 | (rd))
+#define DBG_A64_MOVK_X(rd, imm, hw)	(0xf2800000 | (hw) << 21 | \
+					 ((imm) & 0xffff) << 5 | (rd))
+/* str xt, [xn, #off], off a multiple of 8 */
+#define DBG_A64_STR_X(rt, rn, off)	(0xf9000000 | ((off) / 8) << 10 | \
+					 (rn) << 5 | (rt))
+#define DBG_A64_MRS_MPIDR(rt)		(0xd53800a0 | (rt))
+#define DBG_A64_MRS_CURRENTEL(rt)	(0xd5384240 | (rt))
+#define DBG_A64_DSB_SY			0xd5033f9f
+#define DBG_A64_B			0x14000000
+#define DBG_A64_B_MASK			0xfc000000
+#define DBG_A64_B_IMM			0x03ffffff
+
+static void apple_cpu_dbg_build_stub(u32 *stub, u64 pa, unsigned int cpu,
+				     const u32 *entry, bool spin)
+{
+	s32 target = (s32)((entry[1] & DBG_A64_B_IMM) << 6) >> 4;
+	unsigned int i = 0;
+
+	stub[i++] = DBG_A64_MOVZ_X(0, pa, 0);
+	stub[i++] = DBG_A64_MOVK_X(0, pa >> 16, 1);
+	stub[i++] = DBG_A64_MOVK_X(0, pa >> 32, 2);
+	stub[i++] = DBG_A64_MRS_MPIDR(1);
+	stub[i++] = DBG_A64_STR_X(1, 0, 8);
+	stub[i++] = DBG_A64_MRS_CURRENTEL(1);
+	stub[i++] = DBG_A64_STR_X(1, 0, 16);
+	stub[i++] = DBG_A64_MOVZ_X(1, cpu, 0);
+	stub[i++] = DBG_A64_MOVK_X(1, DBG_MARKER_MAGIC >> 48, 3);
+	stub[i++] = DBG_A64_STR_X(1, 0, 0);
+	stub[i++] = DBG_A64_DSB_SY;
+	if (spin) {
+		stub[i++] = DBG_A64_B;
+		stub[i++] = DBG_A64_B;
+		return;
+	}
+	stub[i++] = entry[0];
+	/* entry[1] branches to 4 + target; it now sits at i * 4. */
+	target += 4 - i * 4;
+	stub[i++] = DBG_A64_B | ((u32)target >> 2 & DBG_A64_B_IMM);
+}
+
+static u64 *apple_cpu_dbg_word(struct apple_cpu_dbg *dbg, phys_addr_t pa)
+{
+	return dbg->m1n1 + (pa - dbg->base);
+}
+
+static u64 *apple_cpu_dbg_slot(struct apple_cpu_dbg *dbg, unsigned int slot,
+			       unsigned int field)
+{
+	return apple_cpu_dbg_word(dbg, dbg->base + DBG_M1N1_SPIN_TABLE +
+				  slot * DBG_M1N1_SLOT_SIZE + field);
+}
+
+/* The restarted core accesses memory with its caches off. */
+static void apple_cpu_dbg_sync(struct apple_cpu_dbg *dbg)
+{
+	unsigned long start = (unsigned long)dbg->m1n1;
+
+	dcache_clean_inval_poc(start, start + DBG_M1N1_SIZE);
+}
+
+static const char *apple_cpu_dbg_where(struct apple_cpu_dbg *dbg, u64 val,
+				       char *buf, size_t len)
+{
+	val &= GENMASK_ULL(47, 0);
+	if (dbg->base && val >= dbg->base && val - dbg->base < DBG_M1N1_SIZE)
+		snprintf(buf, len, " (P+%#llx)", val - dbg->base);
+	else
+		buf[0] = '\0';
+	return buf;
+}
+
+static void apple_cpu_dbg_log_slot(unsigned int cpu, struct apple_cpu_dbg *dbg,
+				   unsigned int slot, const char *when)
+{
+	pr_info("CPU%u: dbg: %s: spin_table[%u] mpidr %#llx flag %#llx target %#llx\n",
+		cpu, when, slot,
+		READ_ONCE(*apple_cpu_dbg_slot(dbg, slot, DBG_M1N1_SLOT_MPIDR)),
+		READ_ONCE(*apple_cpu_dbg_slot(dbg, slot, DBG_M1N1_SLOT_FLAG)),
+		READ_ONCE(*apple_cpu_dbg_slot(dbg, slot, DBG_M1N1_SLOT_TARGET)));
+}
+
+static void apple_cpu_dbg_map_m1n1(unsigned int cpu, struct apple_cpu *ac,
+				   struct apple_cpu_dbg *dbg, u64 release)
+{
+	phys_addr_t table, top;
+	unsigned int i, own;
+	char where[24];
+	u32 target;
+	u64 *p;
+
+	/*
+	 * P comes from cpu-release-addr. Secondary RVBARs are not locked and
+	 * hold more than the address, so they do not identify the image. The
+	 * spin table check below does.
+	 */
+	if (!dbg->base) {
+		pr_info("CPU%u: dbg: m1n1 probe skipped: no P from cpu-release-addr %#llx\n",
+			cpu, release);
+		return;
+	}
+
+	table = dbg->base + DBG_M1N1_SPIN_TABLE;
+	if (release < table + DBG_M1N1_SLOT_TARGET ||
+	    release >= table + DBG_M1N1_SLOTS * DBG_M1N1_SLOT_SIZE ||
+	    (release - table - DBG_M1N1_SLOT_TARGET) % DBG_M1N1_SLOT_SIZE) {
+		pr_info("CPU%u: dbg: m1n1 probe skipped: cpu-release-addr %#llx is not in a spin table at P+%#x\n",
+			cpu, release, DBG_M1N1_SPIN_TABLE);
+		return;
+	}
+	own = (release - table - DBG_M1N1_SLOT_TARGET) / DBG_M1N1_SLOT_SIZE;
+
+	/* The /memreserve/'d image reaches Linux as EFI reserved, unmapped memory. */
+	if (region_intersects(dbg->base, DBG_M1N1_SIZE, IORESOURCE_SYSTEM_RAM,
+			      IORES_DESC_NONE) != REGION_DISJOINT) {
+		pr_info("CPU%u: dbg: m1n1 probe skipped: %pa + %#x overlaps System RAM\n",
+			cpu, &dbg->base, DBG_M1N1_SIZE);
+		return;
+	}
+
+	dbg->m1n1 = memremap(dbg->base, DBG_M1N1_SIZE, MEMREMAP_WB);
+	if (!dbg->m1n1) {
+		pr_info("CPU%u: dbg: m1n1 probe skipped: cannot map %pa\n",
+			cpu, &dbg->base);
+		return;
+	}
+	apple_cpu_dbg_sync(dbg);
+
+	target = READ_ONCE(*(u32 *)apple_cpu_dbg_word(dbg, dbg->base +
+						      DBG_M1N1_TARGET_CPU));
+	pr_info("CPU%u: dbg: m1n1 at P=%pa: code P+0 %08x %08x, P+%#x %08x; target_cpu %u, own slot %u\n",
+		cpu, &dbg->base, ((u32 *)dbg->m1n1)[0], ((u32 *)dbg->m1n1)[1],
+		DBG_M1N1_CPU_RESET, ((u32 *)dbg->m1n1)[DBG_M1N1_CPU_RESET / 4],
+		target, own);
+
+	dbg->slot[dbg->nr_slots++] = own;
+	if (target < DBG_M1N1_SLOTS && target != own)
+		dbg->slot[dbg->nr_slots++] = target;
+
+	for (i = 0; i < dbg->nr_slots; i++) {
+		u64 *mpidr = apple_cpu_dbg_slot(dbg, dbg->slot[i], DBG_M1N1_SLOT_MPIDR);
+		u64 *flag = apple_cpu_dbg_slot(dbg, dbg->slot[i], DBG_M1N1_SLOT_FLAG);
+
+		apple_cpu_dbg_log_slot(cpu, dbg, dbg->slot[i], "before");
+		dbg->saved[i][0] = READ_ONCE(*mpidr);
+		dbg->saved[i][1] = READ_ONCE(*flag);
+		WRITE_ONCE(*mpidr, DBG_SLOT_POISON);
+		WRITE_ONCE(*flag, DBG_SLOT_POISON);
+	}
+
+	top = READ_ONCE(*apple_cpu_dbg_word(dbg, dbg->base + DBG_M1N1_RESET_STACK));
+	if (top >= dbg->base + DBG_STACK_POISON_SIZE &&
+	    top <= dbg->base + DBG_M1N1_SIZE && IS_ALIGNED(top, 16)) {
+		dbg->stack = top - DBG_STACK_POISON_SIZE;
+		p = apple_cpu_dbg_word(dbg, dbg->stack);
+		for (i = 0; i < DBG_STACK_POISON_SIZE / 8; i++)
+			WRITE_ONCE(p[i], DBG_STACK_POISON);
+		pr_info("CPU%u: dbg: reset stack top %pa%s, poisoned %#x bytes below it\n",
+			cpu, &top, apple_cpu_dbg_where(dbg, top, where, sizeof(where)),
+			DBG_STACK_POISON_SIZE);
+	} else {
+		pr_info("CPU%u: dbg: reset stack top %pa outside the image, not poisoned\n",
+			cpu, &top);
+	}
+
+	apple_cpu_dbg_sync(dbg);
+}
+
+/*
+ * The status of the other cores, for comparison: the core running this code
+ * is executing, idle online cores are mostly in WFI, offline ones are off.
+ */
+static void apple_cpu_dbg_log_others(unsigned int cpu)
+{
+	unsigned int self = raw_smp_processor_id(), other;
+
+	for_each_possible_cpu(other) {
+		struct apple_cpu *oac = apple_cpus[other];
+
+		if (!oac || other == cpu)
+			continue;
+		/* The registers of a gated cluster may not respond. */
+		if (oac->cluster->gated) {
+			pr_info("CPU%u: dbg: CPU%u: cluster %u gated, core ps %#x\n",
+				cpu, other, oac->cluster->idx,
+				apple_cpu_dbg_core_ps(oac));
+			continue;
+		}
+		pr_info("CPU%u: dbg: status of CPU%u (cluster %u core %u, %s): %#llx, core ps %#x\n",
+			cpu, other, oac->cluster->idx, oac->core,
+			other == self ? "running this code" :
+			cpu_online(other) ? "online" : "offline",
+			readq(oac->impl + IMPL_CORE_STATUS),
+			apple_cpu_dbg_core_ps(oac));
+	}
+}
+
+static void apple_cpu_dbg_log_rvbar(unsigned int cpu, const char *when,
+				    u64 val, phys_addr_t base)
+{
+	u64 addr = val & DBG_RVBAR_ADDR;
+
+	pr_info("CPU%u: dbg: RVBAR %s %#llx: address [41:12] %#llx (%s P), other bits %#llx, %s\n",
+		cpu, when, val, addr, base && addr == base ? "=" : "!=",
+		val & ~DBG_RVBAR_ADDR,
+		val & IMPL_RVBAR_LOCK ? "locked" : "unlocked");
+}
+
+static void apple_cpu_dbg_prepare(unsigned int cpu, struct apple_cpu *ac,
+				  struct apple_cpu_dbg *dbg)
+{
+	struct apple_cluster *cl = ac->cluster;
+	void __iomem *start = cl->ctrl->start;
+	unsigned int ps, cps, cpm, stop, alive, clus;
+	struct device_node *np;
+	u64 release = 0, val;
+
+	memset(dbg, 0, sizeof(*dbg));
+
+	np = of_get_cpu_node(cpu, NULL);
+	if (np) {
+		of_property_read_u64(np, "cpu-release-addr", &release);
+		of_node_put(np);
+	}
+
+	/*
+	 * cpu-release-addr = P + spin_table + slot * 0x40 + target. P is page
+	 * aligned and the slot offsets stay within the page, so rounding down
+	 * recovers P; apple_cpu_dbg_map_m1n1() checks the slot.
+	 */
+	BUILD_BUG_ON((DBG_M1N1_SPIN_TABLE + DBG_M1N1_SLOT_TARGET) % SZ_4K +
+		     (DBG_M1N1_SLOTS - 1) * DBG_M1N1_SLOT_SIZE >= SZ_4K);
+	if (release > DBG_M1N1_SPIN_TABLE + DBG_M1N1_SLOT_TARGET)
+		dbg->base = round_down(release - DBG_M1N1_SPIN_TABLE -
+				       DBG_M1N1_SLOT_TARGET, SZ_4K);
+
+	pr_info("CPU%u: dbg: cpu-release-addr %#llx: P=%pa\n",
+		cpu, release, &dbg->base);
+	apple_cpu_dbg_log_rvbar(cpu, "at offline", ac->rvbar, dbg->base);
+	val = readq(ac->impl + IMPL_RVBAR);
+	apple_cpu_dbg_log_rvbar(cpu, "at restart", val, dbg->base);
+	val = readq(ac->impl + IMPL_CORE_STATUS);
+	ps = apple_cpu_dbg_ps(cl);
+	cps = apple_cpu_dbg_core_ps(ac);
+	cpm = apple_cpu_dbg_cpm_ps(cl);
+	stop = readl(start + CPU_START_STOP);
+	alive = readl(start + CPU_START_ALIVE);
+	clus = readl(start + CPU_START_CLUSTER(cl->idx));
+	pr_info("CPU%u: dbg: before start: status %#llx, cluster %u ps %#x, core ps %#x, cpm ps %#x, cpu-start stop %#x alive %#x cluster %#x\n",
+		cpu, val, cl->idx, ps, cps, cpm, stop, alive, clus);
+	apple_cpu_dbg_log_others(cpu);
+
+	apple_cpu_dbg_map_m1n1(cpu, ac, dbg, release);
+}
+
+/* The restarted core fetches P+0 with its MMU and caches off. */
+static void apple_cpu_dbg_sync_entry(struct apple_cpu_dbg *dbg)
+{
+	unsigned long start = (unsigned long)dbg->m1n1;
+	unsigned long end = start + DBG_STUB_WORDS * sizeof(u32);
+
+	dcache_clean_inval_poc(start, end);
+	icache_inval_pou(start, end);
+}
+
+static void apple_cpu_dbg_log_code(unsigned int cpu, const char *what,
+				   const u32 *code)
+{
+	char buf[DBG_STUB_WORDS * 9 + 1];
+	unsigned int i, len = 0;
+
+	for (i = 0; i < DBG_STUB_WORDS; i++)
+		len += scnprintf(buf + len, sizeof(buf) - len, " %08x", code[i]);
+	pr_info("CPU%u: dbg: reset_marker: %s:%s\n", cpu, what, buf);
+}
+
+/* reset_marker: patch P+0, see apple_cpu_dbg_build_stub(). */
+static void apple_cpu_dbg_patch_entry(unsigned int cpu, struct apple_cpu *ac,
+				      struct apple_cpu_dbg *dbg)
+{
+	u32 stub[DBG_STUB_WORDS], *code = dbg->m1n1;
+	unsigned int i, mode = READ_ONCE(reset_marker);
+	unsigned long marker;
+	phys_addr_t pa;
+
+	if (!mode)
+		return;
+
+	if (!code) {
+		pr_info("CPU%u: dbg: reset_marker: m1n1 image not found, P+0 not patched\n",
+			cpu);
+		return;
+	}
+
+	if (code[0] != DBG_M1N1_ENTRY0 || code[1] != DBG_M1N1_ENTRY1) {
+		pr_info("CPU%u: dbg: reset_marker: P+0 holds %08x %08x, not %08x %08x, not patched\n",
+			cpu, code[0], code[1], DBG_M1N1_ENTRY0, DBG_M1N1_ENTRY1);
+		return;
+	}
+
+	/* Kept for good: a late core may still write to it. */
+	if (!ac->dbg_marker)
+		ac->dbg_marker = (u64 *)get_zeroed_page(GFP_KERNEL);
+	if (!ac->dbg_marker) {
+		pr_info("CPU%u: dbg: reset_marker: no marker page, P+0 not patched\n",
+			cpu);
+		return;
+	}
+
+	/* Its own page: no dirty line can later overwrite what the core stored. */
+	memset(ac->dbg_marker, 0, DBG_MARKER_WORDS * sizeof(u64));
+	marker = (unsigned long)ac->dbg_marker;
+	dcache_clean_inval_poc(marker, marker + DBG_MARKER_WORDS * sizeof(u64));
+	pa = virt_to_phys(ac->dbg_marker);
+
+	dbg->spin = mode >= 2;
+	apple_cpu_dbg_build_stub(stub, pa, cpu, code, dbg->spin);
+	for (i = 0; i < DBG_STUB_WORDS; i++) {
+		dbg->saved_code[i] = code[i];
+		WRITE_ONCE(code[i], stub[i]);
+	}
+	apple_cpu_dbg_sync_entry(dbg);
+	dbg->patched = true;
+
+	pr_info("CPU%u: dbg: reset_marker: marker at %pa\n", cpu, &pa);
+	apple_cpu_dbg_log_code(cpu, "P+0 was", dbg->saved_code);
+	apple_cpu_dbg_log_code(cpu, "P+0 now", code);
+}
+
+static void apple_cpu_dbg_check_marker(unsigned int cpu, struct apple_cpu *ac,
+				       struct apple_cpu_dbg *dbg)
+{
+	unsigned long marker = (unsigned long)ac->dbg_marker;
+	u32 *code = dbg->m1n1;
+	u64 val, mpidr, el;
+	unsigned int i;
+
+	if (!dbg->patched)
+		return;
+
+	/* Drop any line fetched since: the core wrote to memory. */
+	dcache_inval_poc(marker, marker + DBG_MARKER_WORDS * sizeof(u64));
+	val = READ_ONCE(ac->dbg_marker[0]);
+	mpidr = READ_ONCE(ac->dbg_marker[1]);
+	el = READ_ONCE(ac->dbg_marker[2]);
+
+	if (val != (DBG_MARKER_MAGIC | cpu)) {
+		pr_info("CPU%u: dbg: core reached m1n1 reset entry: no (marker %#llx); P+0 patch left in place\n",
+			cpu, val);
+		return;
+	}
+
+	pr_info("CPU%u: dbg: core reached m1n1 reset entry: yes, MPIDR %#llx (expected affinity %#llx), CurrentEL %#llx (EL%llu)\n",
+		cpu, mpidr, (u64)cpu_logical_map(cpu), el, (el >> 2) & 3);
+
+	/* The core still runs the stub's "b ." */
+	if (dbg->spin) {
+		pr_info("CPU%u: dbg: reset_marker=2: core stopped at the reset entry, P+0 patch left in place\n",
+			cpu);
+		return;
+	}
+
+	for (i = 0; i < DBG_STUB_WORDS; i++)
+		WRITE_ONCE(code[i], dbg->saved_code[i]);
+	apple_cpu_dbg_sync_entry(dbg);
+	dbg->patched = false;
+	apple_cpu_dbg_log_code(cpu, "P+0 restored", code);
+}
+
+static void apple_cpu_dbg_check_slots(unsigned int cpu, struct apple_cpu_dbg *dbg,
+				      bool restore)
+{
+	unsigned int i;
+
+	for (i = 0; i < dbg->nr_slots; i++) {
+		u64 *mpidr = apple_cpu_dbg_slot(dbg, dbg->slot[i], DBG_M1N1_SLOT_MPIDR);
+		u64 *flag = apple_cpu_dbg_slot(dbg, dbg->slot[i], DBG_M1N1_SLOT_FLAG);
+		u64 m = READ_ONCE(*mpidr), f = READ_ONCE(*flag);
+		u64 incs = f - DBG_SLOT_POISON;
+
+		if (m == DBG_SLOT_POISON && !incs)
+			pr_info("CPU%u: dbg: after: spin_table[%u] untouched, smp_secondary_entry did not use it\n",
+				cpu, dbg->slot[i]);
+		else
+			apple_cpu_dbg_log_slot(cpu, dbg, dbg->slot[i],
+					       incs == 2 ? "after (jumped to target)" :
+					       incs == 1 ? "after (waiting for target)" :
+					       "after");
+
+		if (!restore)
+			continue;
+		/* Restore the slot, keeping the increments the core made. */
+		if (m == DBG_SLOT_POISON)
+			WRITE_ONCE(*mpidr, dbg->saved[i][0]);
+		if (incs <= 2)
+			WRITE_ONCE(*flag, dbg->saved[i][1] + incs);
+	}
+}
+
+static void apple_cpu_dbg_check_stack(unsigned int cpu, struct apple_cpu_dbg *dbg)
+{
+	unsigned int i, written = 0, frames = 0, deepest = 0;
+	unsigned int words = DBG_STACK_POISON_SIZE / 8;
+	u64 *p = apple_cpu_dbg_word(dbg, dbg->stack);
+	char where[24];
+
+	for (i = 0; i < words; i++)
+		if (READ_ONCE(p[i]) != DBG_STACK_POISON) {
+			written++;
+			if (!deepest)
+				deepest = (words - i) * 8;
+		}
+
+	pr_info("CPU%u: dbg: reset stack: %u of %u words written, deepest at top-%#x\n",
+		cpu, written, words, deepest);
+
+	/* Saved registers, from the outermost frame down: look for code addresses. */
+	for (i = words; i-- > 0 && frames < DBG_MAX_FRAMES;) {
+		u64 val = READ_ONCE(p[i]);
+
+		if (val == DBG_STACK_POISON || !*apple_cpu_dbg_where(dbg, val, where,
+								     sizeof(where)))
+			continue;
+		pr_info("CPU%u: dbg: reset stack top-%#x: %#llx%s\n",
+			cpu, (words - i) * 8, val, where);
+		frames++;
+	}
+}
+
+/* Poll the core status and the cluster and core power states, log changes. */
+static void apple_cpu_dbg_sample(unsigned int cpu, struct apple_cpu *ac)
+{
+	struct apple_cluster *cl = ac->cluster;
+	unsigned int ps, last_ps, cps, last_cps, changes = 0;
+	u64 status, last_status;
+	ktime_t t0 = ktime_get();
+	s64 us;
+
+	last_status = readq(ac->impl + IMPL_CORE_STATUS);
+	last_ps = apple_cpu_dbg_ps(cl);
+	last_cps = apple_cpu_dbg_core_ps(ac);
+	pr_info("CPU%u: dbg: t=0us status %#llx ps %#x core ps %#x\n",
+		cpu, last_status, last_ps, last_cps);
+
+	do {
+		us = ktime_us_delta(ktime_get(), t0);
+		status = readq(ac->impl + IMPL_CORE_STATUS);
+		ps = apple_cpu_dbg_ps(cl);
+		cps = apple_cpu_dbg_core_ps(ac);
+		if ((status != last_status || ps != last_ps ||
+		     cps != last_cps) && changes++ < DBG_MAX_CHANGES)
+			pr_info("CPU%u: dbg: t=%lldus status %#llx ps %#x core ps %#x\n",
+				cpu, us, status, ps, cps);
+		last_status = status;
+		last_ps = ps;
+		last_cps = cps;
+		usleep_range(10, 20);
+	} while (us < DBG_WATCH_US);
+
+	pr_info("CPU%u: dbg: t=%lldus status %#llx ps %#x core ps %#x after %u changes\n",
+		cpu, us, last_status, last_ps, last_cps, changes);
+}
+
+static void apple_cpu_dbg_watch(unsigned int cpu, struct apple_cpu *ac,
+				struct apple_cpu_dbg *dbg)
+{
+	struct apple_cluster *cl = ac->cluster;
+	void __iomem *start = cl->ctrl->start;
+
+	pr_info("CPU%u: dbg: started: pen release %#llx, cpu-start alive (+%#x) <- %#lx, cluster (+%#x) <- %#lx; readback stop %#x alive %#x cluster %#x\n",
+		cpu, cpu_logical_map(cpu), CPU_START_ALIVE,
+		CPU_START_CORE_BIT(cl->idx, ac->core),
+		CPU_START_CLUSTER(cl->idx), BIT(ac->core),
+		readl(start + CPU_START_STOP),
+		readl(start + CPU_START_ALIVE),
+		readl(start + CPU_START_CLUSTER(cl->idx)));
+
+	apple_cpu_dbg_sample(cpu, ac);
+	apple_cpu_dbg_log_rvbar(cpu, "after restart", readq(ac->impl + IMPL_RVBAR),
+				dbg->base);
+
+	if (dbg->m1n1) {
+		apple_cpu_dbg_sync(dbg);
+		apple_cpu_dbg_check_marker(cpu, ac, dbg);
+		apple_cpu_dbg_check_slots(cpu, dbg, true);
+		if (dbg->stack)
+			apple_cpu_dbg_check_stack(cpu, dbg);
+		apple_cpu_dbg_sync(dbg);
+		memunmap(dbg->m1n1);
+	}
+}
+
 static void apple_cpu_send_ipi(unsigned int cpu)
 {
 	u64 mpidr = cpu_logical_map(cpu);
@@ -1123,6 +1772,8 @@ static int apple_cpu_park_power_down(unsigned int cpu, struct apple_cpu *ac)
 	u64 val;
 	int ret;
 
+	pr_info("CPU%u: dbg: powering down from the park: stop %#x\n", cpu,
+		readl(stop));
 	ret = apple_cpu_park_command(cpu, ac, PARK_CMD_POWER_DOWN);
 	if (ret)
 		return ret;
@@ -1141,6 +1792,9 @@ static int apple_cpu_park_power_down(unsigned int cpu, struct apple_cpu *ac)
 	}
 
 	ac->state = APPLE_CPU_STOPPED;
+	pr_info("CPU%u: dbg: powered down from the park: stop %#x, status %#llx, core ps %#x, cpm ps %#x\n",
+		cpu, stopped, val, apple_cpu_dbg_core_ps(ac),
+		apple_cpu_dbg_cpm_ps(cl));
 	return 0;
 }
 
@@ -1428,6 +2082,9 @@ static int apple_spin_table_cpu_kill(unsigned int cpu)
 			return ret;
 		}
 		ac->state = APPLE_CPU_PARKED;
+		pr_info("CPU%u: dbg: parked: status %#llx, core ps %#x, cpm ps %#x\n",
+			cpu, readq(ac->impl + IMPL_CORE_STATUS),
+			apple_cpu_dbg_core_ps(ac), apple_cpu_dbg_cpm_ps(cl));
 		return 0;
 
 	case APPLE_DIE_GATE:
@@ -1439,6 +2096,10 @@ static int apple_spin_table_cpu_kill(unsigned int cpu)
 		/* Lost its state either way: power up and re-init on next use. */
 		ac->state = APPLE_CPU_STOPPED;
 		apple_cluster_gated(cl);
+		msleep(CLUSTER_DOWN_DELAY_MS);
+		pr_info("CPU%u: dbg: cluster %u gated: ps %#x, core ps %#x, cpm ps %#x\n",
+			cpu, cl->idx, apple_cpu_dbg_ps(cl), apple_cpu_dbg_core_ps(ac),
+			apple_cpu_dbg_cpm_ps(cl));
 		return 0;
 
 	default:
@@ -1480,6 +2141,9 @@ static int apple_cpu_unpark(unsigned int cpu, struct apple_cpu *ac)
 	}
 
 	ac->state = APPLE_CPU_STARTING;
+	pr_info("CPU%u: dbg: left the park: status %#llx, core ps %#x, cpm ps %#x\n",
+		cpu, readq(ac->impl + IMPL_CORE_STATUS), apple_cpu_dbg_core_ps(ac),
+		apple_cpu_dbg_cpm_ps(ac->cluster));
 	return 0;
 }
 
@@ -1487,6 +2151,7 @@ static int apple_cpu_unpark(unsigned int cpu, struct apple_cpu *ac)
 static int apple_cpu_start(unsigned int cpu, struct apple_cpu *ac)
 {
 	struct apple_cluster *cl = ac->cluster;
+	struct apple_cpu_dbg dbg;
 	int ret;
 
 	ret = apple_cluster_power_up(cl);
@@ -1498,6 +2163,8 @@ static int apple_cpu_start(unsigned int cpu, struct apple_cpu *ac)
 		return ret;
 
 	apple_reentry_quiet();
+	apple_cpu_dbg_prepare(cpu, ac, &dbg);
+	apple_cpu_dbg_patch_entry(cpu, ac, &dbg);
 	smp_spin_table_write_pen_release(cpu_logical_map(cpu));
 
 	writel(CPU_START_CORE_BIT(cl->idx, ac->core),
@@ -1507,6 +2174,7 @@ static int apple_cpu_start(unsigned int cpu, struct apple_cpu *ac)
 	sev();
 
 	ac->state = APPLE_CPU_STARTING;
+	apple_cpu_dbg_watch(cpu, ac, &dbg);
 	return 0;
 }
 
@@ -1572,3 +2240,72 @@ const struct cpu_operations apple_spin_table_ops = {
 	.cpu_die	= apple_spin_table_cpu_die,
 	.cpu_kill	= apple_spin_table_cpu_kill,
 };
+
+/*
+ * DEBUG: /sys/kernel/debug/apple-cpu/state: the state of each CPU, of its
+ * cluster, and the boot loader re-entry mode.
+ */
+static const char * const apple_cpu_dbg_state_names[] = {
+	[APPLE_CPU_RUNNING] = "running",
+	[APPLE_CPU_PARKED] = "parked",
+	[APPLE_CPU_STOPPED] = "stopped",
+	[APPLE_CPU_OFF] = "off",
+	[APPLE_CPU_STARTING] = "starting",
+	[APPLE_CPU_STUCK] = "stuck",
+};
+
+static const char * const apple_cpu_dbg_reentry_names[] = {
+	[APPLE_REENTRY_UNKNOWN] = "unknown",
+	[APPLE_REENTRY_MAILBOX] = "warm boot mailbox",
+	[APPLE_REENTRY_M1N1_V161] = "m1n1 v1.6.1",
+};
+
+static int apple_cpu_dbg_state_show(struct seq_file *m, void *v)
+{
+	unsigned int cpu;
+
+	seq_printf(m, "boot loader re-entry: %s, cluster_gating %d\n",
+		   apple_cpu_dbg_reentry_names[apple_reentry.mode],
+		   READ_ONCE(cluster_gating));
+
+	cpus_read_lock();
+	for_each_possible_cpu(cpu) {
+		struct apple_cpu *ac = apple_cpus[cpu];
+		struct apple_cluster *cl;
+
+		if (!ac) {
+			seq_printf(m, "CPU%u: no PMGR control, %s\n", cpu,
+				   cpu_online(cpu) ? "online" : "offline");
+			continue;
+		}
+		cl = ac->cluster;
+		seq_printf(m, "CPU%u: cluster %u core %u, %s, %s; cluster %s%s, core ps %#x, cpm ps %#x\n",
+			   cpu, cl->idx, ac->core,
+			   cpu_online(cpu) ? "online" : "offline",
+			   apple_cpu_dbg_state_names[ac->state],
+			   cl->gated ? "gated" : "powered",
+			   cl->reinit ? " (re-init pending)" : "",
+			   apple_cpu_dbg_core_ps(ac), apple_cpu_dbg_cpm_ps(cl));
+	}
+	cpus_read_unlock();
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(apple_cpu_dbg_state);
+
+static int __init apple_cpu_dbg_init(void)
+{
+	struct dentry *dir;
+	unsigned int cpu;
+
+	for_each_possible_cpu(cpu)
+		if (apple_cpus[cpu])
+			break;
+	if (cpu >= nr_cpu_ids)
+		return 0;
+
+	dir = debugfs_create_dir("apple-cpu", NULL);
+	debugfs_create_file("state", 0444, dir, NULL, &apple_cpu_dbg_state_fops);
+	return 0;
+}
+late_initcall(apple_cpu_dbg_init);
