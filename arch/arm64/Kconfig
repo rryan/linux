@@ -1565,6 +1565,7 @@ config ARM64_APPLE_CPU_HOTPLUG
 	depends on ARCH_APPLE && HOTPLUG_CPU
 	default ARCH_APPLE
 	select KEXEC_CORE
+	select MFD_SYSCON
 	help
 	  Lets spin-table secondary CPUs of Apple SoCs go offline, on systems
 	  whose device tree describes their PMGR CPU controls. An offline CPU
@@ -1575,6 +1576,13 @@ config ARM64_APPLE_CPU_HOTPLUG
 	  Across suspend to RAM, offline CPUs power down through the PMGR
 	  CPU stop control and are started again through the boot loader's
 	  resident secondary entry path, which jumps back to the holding pen.
+
+	  When the last online CPU of a cluster goes offline, the cluster is
+	  power gated as a whole (apple_cpu.cluster_gating, on by default),
+	  provided the boot loader's re-entry path is known to stay off its
+	  console UARTs: an m1n1 that publishes the warm boot mailbox, or the
+	  exact m1n1 v1.6.1 image. Its CPUs are then started again through
+	  that path once the cluster is powered up.
 
 # Common NUMA Features
 config NUMA
