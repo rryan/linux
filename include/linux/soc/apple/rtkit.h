@@ -193,6 +193,16 @@ int apple_rtkit_poweroff(struct apple_rtkit *rtk);
 int apple_rtkit_idle(struct apple_rtkit *rtk);
 
 /*
+ * Notify the co-processor that the application processor is sleeping or awake,
+ * without changing the co-processor's own power state or restarting endpoints.
+ * Waits for acknowledgment; requires interrupts and the RTKit worker to run.
+ * The caller must serialize power transitions and stop application messages
+ * before sleeping, until a wake notification succeeds. On failure, the remote
+ * state is uncertain: attempt a wake notification before reusing endpoints.
+ */
+int apple_rtkit_set_ap_sleep(struct apple_rtkit *rtk, bool sleep);
+
+/*
  * Checks if RTKit is running and ready to handle messages.
  */
 bool apple_rtkit_is_running(struct apple_rtkit *rtk);

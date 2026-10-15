@@ -24,6 +24,7 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/seq_file.h>
 #include <linux/unaligned.h>
+#include <linux/suspend.h>
 
 #define SMC_ENDPOINT			0x20
 
@@ -74,6 +75,8 @@ static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 		return -EIO;
 	if (smc->atomic_mode)
 		return -EIO;
+	if (smc->ap_sleep)
+		return -EBUSY;
 
 	reinit_completion(&smc->cmd_done);
 
@@ -129,6 +132,9 @@ static int apple_smc_rw_locked(struct apple_smc *smc, smc_key key,
 	u64 cmd;
 
 	lockdep_assert_held(&smc->mutex);
+
+	if (smc->ap_sleep)
+		return -EBUSY;
 
 	if (rsize > SMC_MAX_SIZE)
 		return -EINVAL;
@@ -265,6 +271,8 @@ int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, 
 		return -EIO;
 	if (!smc->atomic_mode)
 		return -EIO;
+	if (READ_ONCE(smc->ap_sleep))
+		return -EBUSY;
 
 	memcpy_toio(smc->shmem.iomem, buf, size);
 	smc->msg_id = (smc->msg_id + 1) & 0xf;
@@ -548,12 +556,17 @@ static int apple_smc_probe(struct platform_device *pdev)
  * The announcement only tells the SMC that the system is asleep; it does not
  * by itself power anything down under s2idle. It can be disabled with the
  * sleep_handshake module parameter. MBSW is read-only and always logged.
+ *
+ * For suspend-to-RAM, defer the announcement to suspend_late and then notify
+ * RTKit that the AP is asleep, leaving the SMC itself running. Block key
+ * commands until resume_early acknowledges the AP wake, including on abort.
+ * The RTKit acknowledgment needs interrupts and its non-freezable worker.
  */
 static bool sleep_handshake = true;
 module_param(sleep_handshake, bool, 0644);
 MODULE_PARM_DESC(sleep_handshake, "Announce system sleep and wake to the SMC (default: on)");
 
-static int apple_smc_suspend(struct device *dev)
+static int apple_smc_announce_sleep(struct device *dev)
 {
 	struct apple_smc *smc = dev_get_drvdata(dev);
 	int ret;
@@ -568,21 +581,39 @@ static int apple_smc_suspend(struct device *dev)
 			dev_warn(dev, "Failed to write WKTP (%d)\n", ret);
 	}
 
-	ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), SMC_KEY(slpa));
+	/*
+	 * Serialize the last key command with background power/thermal work.
+	 * Do not hold the mutex while waiting for an RTKit management reply:
+	 * queued notifications on that worker may themselves try to read keys.
+	 */
+	scoped_guard(mutex, &smc->mutex) {
+		u32 command = SMC_KEY(slpa);
+
+		ret = apple_smc_rw_locked(smc, SMC_KEY(MBSE), &command,
+					  sizeof(command), NULL, 0);
+		if (ret >= 0) {
+			smc->sleep_announced = true;
+			if (pm_suspend_target_state == PM_SUSPEND_MEM)
+				WRITE_ONCE(smc->ap_sleep, true);
+		}
+	}
 	if (ret < 0) {
 		dev_warn(dev, "Failed to announce sleep (MBSE = slpa): %d\n", ret);
-		return 0;
+		return pm_suspend_target_state == PM_SUSPEND_MEM ? ret : 0;
 	}
-	smc->sleep_announced = true;
 
 	return 0;
 }
 
-static int apple_smc_resume(struct device *dev)
+static int apple_smc_announce_wake(struct device *dev)
 {
 	struct apple_smc *smc = dev_get_drvdata(dev);
 	u64 wake_reasons;
 	int ret;
+
+	/* A failed AP wake notification must leave application keys blocked. */
+	if (smc->ap_sleep)
+		return -EIO;
 
 	ret = apple_smc_read_u64(smc, SMC_KEY(MBSW), &wake_reasons);
 	if (ret < 0)
@@ -601,7 +632,77 @@ static int apple_smc_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(apple_smc_pm_ops, apple_smc_suspend, apple_smc_resume);
+static int apple_smc_suspend(struct device *dev)
+{
+	if (pm_suspend_target_state == PM_SUSPEND_MEM)
+		return 0;
+
+	return apple_smc_announce_sleep(dev);
+}
+
+static int apple_smc_resume(struct device *dev)
+{
+	if (pm_suspend_target_state == PM_SUSPEND_MEM)
+		return 0;
+
+	return apple_smc_announce_wake(dev);
+}
+
+static int apple_smc_resume_early(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+	int ret;
+
+	if (pm_suspend_target_state != PM_SUSPEND_MEM)
+		return 0;
+
+	if (!smc->ap_sleep)
+		return apple_smc_announce_wake(dev);
+
+	ret = apple_rtkit_set_ap_sleep(smc->rtk, false);
+	if (ret) {
+		dev_err(dev, "SMC AP wake acknowledgment failed: %d\n", ret);
+		return ret;
+	}
+
+	scoped_guard(mutex, &smc->mutex)
+		WRITE_ONCE(smc->ap_sleep, false);
+
+	dev_info(dev, "SMC acknowledged AP wake\n");
+	return apple_smc_announce_wake(dev);
+}
+
+static int apple_smc_suspend_late(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+	int ret;
+
+	if (pm_suspend_target_state != PM_SUSPEND_MEM)
+		return 0;
+
+	ret = apple_smc_announce_sleep(dev);
+	if (ret || !smc->ap_sleep)
+		return ret;
+
+	ret = apple_rtkit_set_ap_sleep(smc->rtk, true);
+	if (ret) {
+		dev_err(dev, "SMC AP sleep acknowledgment failed: %d\n", ret);
+		/*
+		 * A lost acknowledgment does not mean the request was ignored.
+		 * This callback's failure skips its paired resume_early callback.
+		 */
+		apple_smc_resume_early(dev);
+		return ret;
+	}
+
+	dev_info(dev, "SMC acknowledged AP sleep\n");
+	return 0;
+}
+
+static const struct dev_pm_ops apple_smc_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(apple_smc_suspend, apple_smc_resume)
+	LATE_SYSTEM_SLEEP_PM_OPS(apple_smc_suspend_late, apple_smc_resume_early)
+};
 
 static const struct of_device_id apple_smc_of_match[] = {
 	{ .compatible = "apple,t8103-smc" },

@@ -101,6 +101,7 @@ enum apple_smc_boot_stage {
  * @mutex: Mutex for non-atomic mode
  * @lock: Spinlock for atomic mode
  * @sleep_announced: MBSE = 'slpa' was sent at suspend; send 'waka' at resume
+ * @ap_sleep: Key traffic blocked until RTKit acknowledges the AP wake notification
  */
 struct apple_smc {
 	struct device *dev;
@@ -131,6 +132,7 @@ struct apple_smc {
 	spinlock_t lock;
 
 	bool sleep_announced;
+	bool ap_sleep;
 };
 
 /**

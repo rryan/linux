@@ -999,6 +999,14 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 	return 0;
 }
 
+int apple_rtkit_set_ap_sleep(struct apple_rtkit *rtk, bool sleep)
+{
+	return apple_rtkit_set_ap_power_state(rtk, sleep ?
+					     APPLE_RTKIT_PWR_STATE_IDLE :
+					     APPLE_RTKIT_PWR_STATE_ON);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_ap_sleep);
+
 static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 					   unsigned int state)
 {
